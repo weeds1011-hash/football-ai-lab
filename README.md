@@ -7,6 +7,15 @@ Football AI Lab은 Windows 11에서 실행하고 Streamlit Community Cloud에 �
 > 이 앱은 통계 분석·교육용입니다. 예측 정확도나 수익률을 보장하지 않으며 자동
 > 베팅·구매 기능을 제공하지 않습니다. 데모의 팀, 수치, 배당은 모두 **가상 데이터**입니다.
 
+## 배포 주소
+
+- Streamlit Community Cloud: <https://football-ai-lab.streamlit.app/>
+- GitHub: <https://github.com/weeds1011-hash/football-ai-lab>
+
+2026년 10월 27일 기준 저장소의 `main` 브랜치와 루트 `app.py`, Python 3.12 설정으로
+배포를 검증했습니다. 배포 앱에서 가상 데모, CSV 업로드, 프로토 분석, 승무패 14경기
+상위 20개 조합 계산을 직접 실행해 정상 동작을 확인했습니다.
+
 ## 구현 기능
 
 - 여러 경기 CSV 업로드(UTF-8/CP949)와 결과 CSV 다운로드
