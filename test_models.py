@@ -193,3 +193,10 @@ def test_streamlit_demo_buttons_complete_without_exception() -> None:
     combination_search = app.session_state["toto_bundle"][1]
     assert len(combination_search.combinations) == 20
     assert combination_search.max_frontier_size == 20
+
+
+def test_streamlit_real_api_mode_without_key_keeps_csv_fallback() -> None:
+    app = AppTest.from_file(str(ROOT / "app.py")).run(timeout=30)
+    app.radio(key="proto_source").set_value("실제 데이터 API").run(timeout=30)
+    assert not list(app.exception)
+    assert any("API 키가 설정되지 않았습니다" in item.value for item in app.warning)
