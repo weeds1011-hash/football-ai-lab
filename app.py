@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from datetime import datetime
+import hashlib
 import os
 from pathlib import Path
+import tempfile
 
 import pandas as pd
 import streamlit as st
@@ -293,7 +295,7 @@ with st.expander("모델 설정", expanded=False):
 
 config = ModelConfig(dixon_coles_rho=rho, home_advantage_elo=float(home_advantage))
 
-proto_tab, toto_tab = st.tabs(("프로토 분석", "승무패 14경기"))
+proto_tab, toto_tab, year_tab = st.tabs(("프로토 분석", "승무패 14경기", "2026 승무패 백테스트"))
 
 with proto_tab:
     st.subheader("프로토 경기 분석")
@@ -406,6 +408,59 @@ with toto_tab:
             mime="text/csv",
             key="toto_download",
         )
+
+with year_tab:
+    from backtest_2026 import HISTORY_COLUMNS, ROUND_COLUMNS, empty_round_status, run as run_2026_backtest
+
+    st.subheader("2026 승무패 백테스트")
+    st.caption("2026-10-27 조사 범위는 1~63회차입니다. 현재 확보한 이력으로 과거 시점을 재구성하며 실제 당시 기록한 예측과 다릅니다.")
+    st.info("베트맨 자료를 자동 수집하지 않습니다. 사용·재배포 권한과 경기 순서를 확인한 CSV와 결과 확정시각이 있는 경기 이력을 사용합니다.")
+    st.download_button("회차 입력 양식 다운로드", pd.DataFrame(columns=ROUND_COLUMNS).to_csv(index=False).encode("utf-8-sig"),
+                       file_name="rounds_2026_template.csv", mime="text/csv", key="year_round_template")
+    st.download_button("경기 이력 양식 다운로드", pd.DataFrame(columns=HISTORY_COLUMNS).to_csv(index=False).encode("utf-8-sig"),
+                       file_name="history_2026_template.csv", mime="text/csv", key="year_history_template")
+    round_upload = st.file_uploader("2026 회차 CSV", type="csv", key="year_round_upload")
+    history_upload = st.file_uploader("경기 이력 CSV", type="csv", key="year_history_upload")
+    signature = None
+    if round_upload is not None and history_upload is not None:
+        signature = hashlib.sha256(round_upload.getvalue() + history_upload.getvalue()).hexdigest()
+        if st.button("전 회차 예측 및 검증", type="primary", key="year_run"):
+            try:
+                rounds_input = pd.read_csv(round_upload, encoding="utf-8-sig")
+                history_input = pd.read_csv(history_upload, encoding="utf-8-sig")
+                with st.spinner("회차별로 예측을 고정하고 검증 중입니다..."):
+                    with tempfile.TemporaryDirectory(prefix="football-ai-backtest-") as temp_dir:
+                        tables = run_2026_backtest(rounds_input, history_input, Path(temp_dir))
+                st.session_state["year_results"] = {"signature": signature, "tables": tables}
+            except (ValueError, OSError, pd.errors.ParserError) as exc:
+                st.error(f"백테스트 데이터 오류: {exc}")
+    else:
+        st.caption("두 파일이 모두 있어야 전력 계산을 시작합니다. 빈 양식에는 실제 경기나 점수가 없습니다.")
+    stored_year = st.session_state.get("year_results")
+    tables = stored_year["tables"] if isinstance(stored_year, dict) and stored_year.get("signature") == signature and signature else None
+    show_actual = st.toggle("실제 결과와 성능 공개", value=False, key="year_reveal") if tables else False
+    status_table = tables["rounds"].copy() if tables else empty_round_status()
+    if not show_actual:
+        status_table = status_table.drop(columns=["단식 적중", "TOP20 최고 적중", "TOP20 정답 포함"])
+    st.dataframe(status_table, hide_index=True, width="stretch")
+    if tables:
+        selected = st.selectbox("회차 선택", list(range(1, 64)), key="year_selected_round")
+        matches = tables["matches"]
+        selected_matches = matches.loc[matches["회차"] == selected]
+        if selected_matches.empty:
+            st.warning("이 회차는 14경기나 경기 전 전력 자료가 부족하여 분석되지 않았습니다.")
+        else:
+            prediction_columns = ["번호", "홈팀", "원정팀", "홈승%", "무%", "원정승%", "AI 선택", "두번째", "예상 스코어", "전력 자료"]
+            st.dataframe(selected_matches.loc[:, prediction_columns + (["실제 스코어", "실제 결과", "적중"] if show_actual else [])], hide_index=True, width="stretch")
+            top = tables["top20"].loc[tables["top20"]["회차"] == selected]
+            st.dataframe(top if show_actual else top[["순위", "조합", "확률"]], hide_index=True, width="stretch")
+        if show_actual and not matches.empty:
+            st.write(f"분석 {len(matches)}경기 · 단식 적중률 {matches['적중'].mean()*100:.2f}% · Brier {matches['Brier Score'].mean():.4f} · Log Loss {matches['Log Loss'].mean():.4f}")
+            st.write(f"홈승 기준선 {matches['홈승 기준선 적중'].mean()*100:.2f}% · 과거 빈도 기준선 {matches['빈도 기준선 적중'].mean()*100:.2f}%")
+            trend = matches.groupby("회차")["적중"].mean().mul(100)
+            st.line_chart(trend)
+            st.download_button("경기별 비교 CSV 다운로드", result_csv_bytes(matches), file_name="backtest_2026_matches.csv", mime="text/csv", key="year_download")
+    st.caption("검증된 회차만 집계합니다. 당시 이력의 실제 제공 가능 시점, 정정 여부, 투표율과 수익률은 자동 검증하지 않습니다.")
 
 with st.expander("CSV 형식 안내"):
     st.markdown(
