@@ -10,3 +10,4 @@ __pycache__/
 *.sqlite3
 .DS_Store
 Thumbs.db
+reports/local_backtest_2026/
