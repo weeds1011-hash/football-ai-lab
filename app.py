@@ -12,8 +12,6 @@ import pandas as pd
 import streamlit as st
 from streamlit.errors import StreamlitSecretNotFoundError
 
-from backtest_2026 import HISTORY_COLUMNS, ROUND_COLUMNS, empty_round_status, run as run_2026_backtest
-
 from football_data import (
     FREE_COMPETITIONS,
     FootballDataClient,
@@ -412,6 +410,8 @@ with toto_tab:
         )
 
 with year_tab:
+    from backtest_2026 import HISTORY_COLUMNS, ROUND_COLUMNS, empty_round_status, run as run_2026_backtest
+
     st.subheader("2026 승무패 백테스트")
     st.caption("2026-10-27 조사 범위는 1~63회차입니다. 현재 확보한 이력으로 과거 시점을 재구성하며 실제 당시 기록한 예측과 다릅니다.")
     st.info("베트맨 자료를 자동 수집하지 않습니다. 사용·재배포 권한과 경기 순서를 확인한 CSV와 결과 확정시각이 있는 경기 이력을 사용합니다.")
