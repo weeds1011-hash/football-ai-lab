@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 import hashlib
+import json
 import os
 from pathlib import Path
 
@@ -11,6 +12,13 @@ import pandas as pd
 import streamlit as st
 from streamlit.errors import StreamlitSecretNotFoundError
 
+from backtesting import (
+    PRODUCT_PROTO, PRODUCT_TOTO, aggregate_evaluations, backtest_template_csv,
+    create_prediction_snapshot, evaluate_snapshot, history_template_csv,
+    prediction_display_frame, prepare_round, product_rows, read_backtest_file,
+    read_history_file, reconstructed_model_input, round_status_frame,
+    snapshot_model_input,
+)
 from betman_data import (
     BETMAN_HOME_URL,
     BETMAN_TERMS_URL,
@@ -48,6 +56,7 @@ from models import (
 
 APP_DIR = Path(__file__).resolve().parent
 DEMO_CSV = APP_DIR / "data" / "demo_14_matches.csv"
+DEMO_BACKTEST_CSV = APP_DIR / "data" / "demo_backtest_rounds.csv"
 FREE_COMPETITION_BY_CODE = {item.code: item for item in FREE_COMPETITIONS}
 
 st.set_page_config(
@@ -550,6 +559,191 @@ def show_probability_table(result: pd.DataFrame) -> None:
     )
 
 
+def snapshot_download_bytes(snapshot) -> bytes:
+    """정답을 포함하지 않는 예측과 재현 메타데이터를 내보낸다."""
+    content = {
+        "snapshot_id": snapshot.snapshot_id,
+        "product": snapshot.product,
+        "round_id": snapshot.round_id,
+        "cutoff": snapshot.cutoff.isoformat(),
+        "cutoff_basis": snapshot.cutoff_basis,
+        "model_version": snapshot.model_version,
+        "model_config": snapshot.model_config,
+        "mode": snapshot.mode,
+        "created_at": snapshot.created_at.isoformat(),
+        "source": snapshot.source_label,
+        "acquired_at": snapshot.acquired_at_label,
+        "history_match_count": snapshot.history_match_count,
+        "history_start": snapshot.history_start,
+        "history_end": snapshot.history_end,
+        "history_sources": snapshot.history_sources,
+        "predictions": snapshot.predictions.to_dict(orient="records"),
+        "top_combinations": (
+            [{"outcomes": list(labels), "probability": probability}
+             for labels, probability in snapshot.top_combinations.combinations]
+            if snapshot.top_combinations else []
+        ),
+    }
+    return json.dumps(content, ensure_ascii=False, indent=2).encode("utf-8")
+
+
+def show_backtest_metrics(evaluation) -> None:
+    st.write(
+        f"분석 {evaluation.total_matches}경기 · 적중 {evaluation.correct_matches}경기 · "
+        f"적중률 {evaluation.accuracy * 100:.2f}%"
+    )
+    st.write(f"다중분류 Brier Score {evaluation.brier_score:.4f} · Log Loss {evaluation.log_loss:.4f}")
+    st.caption("Brier Score는 세 결과의 제곱오차 합의 경기 평균입니다. 두 점수는 낮을수록 좋습니다.")
+
+
+def show_backtest_tab(config: ModelConfig) -> None:
+    st.subheader("과거 회차 백테스트")
+    st.caption("현재 확보한 과거 자료로 경기 전 시점을 재구성합니다. 적중률, 확률 보정, 수익성은 서로 다릅니다.")
+    source = st.radio("백테스트 자료", ("가상 테스트 자료", "사용자 과거 회차 파일"), key="backtest_source")
+    if source == "가상 테스트 자료":
+        st.warning("가상 데이터: 경기·점수·전력 수치는 기능 시험용이며 실제 회차가 아닙니다.")
+        payload = DEMO_BACKTEST_CSV.read_bytes()
+        filename = DEMO_BACKTEST_CSV.name
+    else:
+        st.info("베트맨 자동 수집은 제공하지 않습니다. 이용 권한을 확인한 CSV/XLSX를 업로드하세요.")
+        st.download_button("과거 회차 빈 템플릿", backtest_template_csv(),
+                           file_name="backtest_round_template.csv", mime="text/csv", key="bt_template")
+        upload = st.file_uploader("과거 회차 CSV 또는 XLSX", type=("csv", "xlsx"), key="bt_upload")
+        if upload is None:
+            st.info("완료된 경기와 결과를 포함한 파일을 선택하세요.")
+            return
+        payload, filename = upload.getvalue(), upload.name
+    try:
+        frame = read_backtest_file(payload, filename)
+    except (ValueError, OSError) as exc:
+        st.error(f"과거 회차 파일 오류: {exc}")
+        return
+    product = st.radio("상품", (PRODUCT_PROTO, PRODUCT_TOTO), key="bt_product", horizontal=True)
+    status = round_status_frame(frame, product)
+    if status.empty:
+        st.info("이 상품에 해당하는 회차가 없습니다.")
+        return
+    st.dataframe(status, width="stretch", hide_index=True)
+    round_ids = status["회차"].tolist()
+    selected_round = st.selectbox("과거 회차", round_ids, key="bt_round")
+    try:
+        prepared = prepare_round(frame, product, selected_round)
+    except ValueError as exc:
+        st.error(f"회차 불완전: {exc}")
+        return
+    context = prepared.context
+    st.caption(f"기준시각: {context.cutoff.strftime('%Y-%m-%d %H:%M %Z')} · {context.cutoff_basis}")
+    st.caption(f"회차 자료 출처: {context.source_label} · 확보 기준시각: {context.acquired_at_label}")
+    st.dataframe(context.target_frame.loc[:, ["match_no", "kickoff_kst", "league", "home_team", "away_team"]].rename(
+        columns={"match_no": "경기번호", "kickoff_kst": "경기시각", "league": "리그",
+                 "home_team": "홈팀", "away_team": "원정팀"}), width="stretch", hide_index=True)
+    mode = st.radio("전력 자료", ("경기 전 입력값으로 현재 재계산", "결과 확정시각이 있는 과거 이력으로 재구성"), key="bt_mode")
+    history_payload = b""
+    history_filename = ""
+    if mode.startswith("경기 전 입력값"):
+        st.caption("파일의 스냅샷시각과 전력 입력을 검증해 지금의 모델로 다시 계산합니다. 당시 저장된 예측의 증거는 아닙니다. 원래 저장된 예측 가져오기는 아직 지원하지 않습니다.")
+    else:
+        st.caption("경기 시작·결과 확정·출처·확보시각을 포함한 사용자 이력이 필요합니다. 기준시각 이후 확정된 결과는 제외합니다.")
+        st.download_button("과거 이력 빈 템플릿", history_template_csv(), file_name="backtest_history_template.csv",
+                           mime="text/csv", key="bt_history_template")
+        history_upload = st.file_uploader("경기 이력 CSV 또는 XLSX", type=("csv", "xlsx"), key="bt_history")
+        if history_upload is not None:
+            history_payload, history_filename = history_upload.getvalue(), history_upload.name
+    signature = hashlib.sha256(payload + history_payload + product.encode() + selected_round.encode()
+                               + mode.encode() + repr(config).encode()).hexdigest()
+    if st.button("경기 전 시점 AI 분석", type="primary", key="bt_predict"):
+        try:
+            with st.spinner("기준시각 이전 자료로 예측을 고정하고 있습니다..."):
+                if mode.startswith("경기 전 입력값"):
+                    model_input = snapshot_model_input(context)
+                else:
+                    if not history_payload:
+                        raise ValueError("과거 이력 파일을 선택하세요.")
+                    model_input = reconstructed_model_input(context, read_history_file(history_payload, history_filename))
+                snapshot = create_prediction_snapshot(context, model_input, config)
+            st.session_state["bt_frozen"] = {"signature": signature, "snapshot": snapshot,
+                                             "outcomes": prepared.outcomes, "evidence": model_input.evidence_frame}
+            st.session_state.pop("bt_evaluation", None)
+        except (ValueError, FootballDataError) as exc:
+            st.error(f"백테스트 준비 오류: {exc}")
+    frozen = st.session_state.get("bt_frozen")
+    if isinstance(frozen, dict) and frozen.get("signature") == signature:
+        snapshot = frozen["snapshot"]
+        st.success(f"예측 고정 완료 · ID {snapshot.snapshot_id} · 세션에 저장됨")
+        st.caption(f"모델 {snapshot.model_version} · {snapshot.mode} · 사용 이력 {snapshot.history_match_count}경기 "
+                   f"({snapshot.history_start} ~ {snapshot.history_end})")
+        st.caption(f"경기 이력 출처·확보시각: {snapshot.history_sources}")
+        st.dataframe(prediction_display_frame(snapshot), width="stretch", hide_index=True)
+        with st.expander("전력 입력 근거"):
+            st.dataframe(frozen["evidence"], width="stretch", hide_index=True)
+        if snapshot.top_combinations is not None:
+            st.markdown("#### 예측 상위 20개 조합")
+            st.dataframe(snapshot.top_combinations.to_frame(), width="stretch", hide_index=True)
+        st.download_button("결과 없는 예측 스냅샷 JSON 다운로드", snapshot_download_bytes(snapshot),
+                           file_name="backtest_prediction.json", mime="application/json", key="bt_snapshot_download")
+        st.caption("세션 저장은 브라우저 새로고침이나 서버 재시작 후 유지되지 않을 수 있습니다. JSON을 보관하세요.")
+        if st.button("실제 결과 공개 및 비교", key="bt_reveal"):
+            try:
+                st.session_state["bt_evaluation"] = {"signature": signature,
+                    "result": evaluate_snapshot(snapshot, frozen["outcomes"])}
+            except ValueError as exc:
+                st.error(f"결과 비교 오류: {exc}")
+        evaluation_state = st.session_state.get("bt_evaluation")
+        if isinstance(evaluation_state, dict) and evaluation_state.get("signature") == signature:
+            evaluation = evaluation_state["result"]
+            show_backtest_metrics(evaluation)
+            st.dataframe(evaluation.match_frame, width="stretch", hide_index=True)
+            st.markdown("#### 리그별 성능")
+            st.dataframe(evaluation.league_frame, width="stretch", hide_index=True)
+            st.markdown("#### 날짜·회차별 성능")
+            st.dataframe(evaluation.trend_frame, width="stretch", hide_index=True)
+            if evaluation.actual_combination is not None:
+                st.write(f"실제 조합: {evaluation.actual_combination}")
+                st.write(f"상위 20개 포함: {'예' if evaluation.actual_in_top20 else '아니요'} · "
+                         f"최상위 조합 일치 {evaluation.top1_matching_matches}/14 · "
+                         f"전체 적중: {'예' if evaluation.all_14_correct else '아니요'}")
+            st.download_button("백테스트 비교 결과 CSV 다운로드", result_csv_bytes(evaluation.match_frame),
+                               file_name="backtest_evaluation.csv", mime="text/csv", key="bt_result_download")
+    else:
+        st.info("회차와 자료를 확인한 뒤 경기 전 시점 AI 분석을 실행하세요.")
+
+    with st.expander("여러 회차 백테스트"):
+        st.caption("경기 전 입력 스냅샷이 있는 완료 회차를 대상으로 모든 예측을 먼저 고정하고 결과를 비교합니다.")
+        batch_size = st.selectbox("최근 회차 수", (5, 10, 20), key="bt_batch_size")
+        completed = status.loc[status["상태"] == "완료", "회차"].tolist()
+        completed.sort(key=lambda rid: product_rows(frame, product).loc[
+            product_rows(frame, product)["round_id"] == rid, "kickoff_kst"].min(), reverse=True)
+        chosen = completed[:batch_size]
+        st.caption(f"요청 {batch_size}회차 중 파일에서 완료된 {len(chosen)}회차를 선택했습니다.")
+        if st.button("다회차 예측 고정 및 비교", key="bt_batch_run"):
+            try:
+                if not chosen:
+                    raise ValueError("완료된 회차가 없습니다.")
+                items = []
+                for rid in chosen:
+                    item = prepare_round(frame, product, rid)
+                    snap = create_prediction_snapshot(item.context, snapshot_model_input(item.context), config)
+                    items.append((snap, item.outcomes))
+                evaluations = [evaluate_snapshot(snap, outcomes) for snap, outcomes in items]
+                st.session_state["bt_batch"] = {"signature": hashlib.sha256(payload + product.encode() + repr(config).encode() + str(batch_size).encode()).hexdigest(),
+                                                  "evaluations": evaluations}
+            except ValueError as exc:
+                st.error(f"다회차 백테스트 오류: {exc}")
+        batch_signature = hashlib.sha256(payload + product.encode() + repr(config).encode() + str(batch_size).encode()).hexdigest()
+        batch = st.session_state.get("bt_batch")
+        if isinstance(batch, dict) and batch.get("signature") == batch_signature:
+            aggregate = aggregate_evaluations(batch["evaluations"])
+            show_backtest_metrics(aggregate)
+            st.dataframe(aggregate.trend_frame, width="stretch", hide_index=True)
+            st.dataframe(aggregate.league_frame, width="stretch", hide_index=True)
+            chart = aggregate.trend_frame.sort_values("날짜").set_index("날짜")[["적중률(%)"]]
+            st.line_chart(chart)
+            detail = st.selectbox("회차별 상세", [item.round_id for item in batch["evaluations"]], key="bt_batch_detail")
+            item = next(item for item in batch["evaluations"] if item.round_id == detail)
+            st.dataframe(item.match_frame, width="stretch", hide_index=True)
+    st.info("배당 수익률은 계산하지 않습니다. 단일 회차 또는 가상 자료로 모델 우수성이나 수익성을 판단할 수 없습니다.")
+
+
 st.title("⚽ Football AI Lab")
 st.caption("포아송 · Dixon–Coles · Elo 기반의 설명 가능한 축구 분석 MVP")
 st.warning(
@@ -576,7 +770,7 @@ with st.expander("모델 설정", expanded=False):
 
 config = ModelConfig(dixon_coles_rho=rho, home_advantage_elo=float(home_advantage))
 
-proto_tab, toto_tab = st.tabs(("프로토 분석", "승무패 14경기"))
+proto_tab, toto_tab, backtest_tab = st.tabs(("프로토 분석", "승무패 14경기", "과거 회차 백테스트"))
 
 with proto_tab:
     st.subheader("프로토 경기 분석")
@@ -689,6 +883,9 @@ with toto_tab:
             mime="text/csv",
             key="toto_download",
         )
+
+with backtest_tab:
+    show_backtest_tab(config)
 
 with st.expander("CSV 형식 안내"):
     st.markdown(
