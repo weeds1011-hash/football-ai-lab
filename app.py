@@ -430,6 +430,8 @@ with st.expander("실제 데이터 API 안내"):
         """
     )
 
+st.caption("Football data provided by the Football-Data.org API")
+
 with st.expander("갤럭시 홈 화면에 추가"):
     st.markdown(
         """

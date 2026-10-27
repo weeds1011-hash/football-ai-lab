@@ -80,6 +80,8 @@ uv venv --python 3.12.13 .venv
 
 ## football-data.org 실제 데이터
 
+> Football data provided by the Football-Data.org API
+
 실제 데이터 모드는 [football-data.org API v4](https://docs.football-data.org/general/v4/index.html)의
 경기 일정, 팀 식별 정보와 최종 결과를 사용합니다. 2026년 10월 확인한
 [공식 무료 플랜](https://www.football-data.org/pricing)은 12개 대회와 기본 일정·결과·순위,
