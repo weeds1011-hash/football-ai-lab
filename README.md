@@ -25,6 +25,9 @@ Football AI Lab은 Windows 11에서 실행하고 Streamlit Community Cloud에 �
 - 입력 배당 기준 기대수익률 `(모델 확률 × 배당 - 1) × 100`
 - 승무패 14경기 확률표와 확률 상위 20개 조합
 - 무승부 가능성 및 비우세 결과 합계가 큰 경기 표시
+- football-data.org v4 실제 일정·팀·최종 결과 연동 준비
+- 최근 5·10경기, 홈/원정 성적, 득실점 평균 및 순차 Elo 자동 계산
+- 실제 결과 기반 모델 추정 기대득점과 표본 부족 불확실성 표시
 - 갤럭시 세로 화면을 고려한 한국어 반응형 화면
 
 ## Windows 설치와 실행
@@ -75,6 +78,35 @@ uv venv --python 3.12.13 .venv
 `data/demo_14_matches.csv`에서 확인할 수 있으며 모든 행에 `가상 데이터`가 표시되어
 있습니다.
 
+## football-data.org 실제 데이터
+
+실제 데이터 모드는 [football-data.org API v4](https://docs.football-data.org/general/v4/index.html)의
+경기 일정, 팀 식별 정보와 최종 결과를 사용합니다. 2026년 10월 확인한
+[공식 무료 플랜](https://www.football-data.org/pricing)은 12개 대회와 기본 일정·결과·순위,
+분당 10회 요청을 제공합니다. 무료 제공 대회는 공식
+[Coverage 페이지](https://www.football-data.org/coverage)를 기준으로 앱 선택 목록에
+표시했습니다. 무료 데이터 범위와 요청 한도는 서비스 정책에 따라 바뀔 수 있습니다.
+
+무료 플랜에 배당과 실측 xG가 포함된다고 가정하지 않습니다. 실제 데이터 모드의
+`홈 기대득점`과 `원정 기대득점`은 완료 경기의 득실점으로 계산한 **모델 추정치**이며
+실측 xG가 아닙니다. 배당이 없으면 기대수익률 열을 표시하지 않습니다.
+
+로컬에서는 예시 파일을 복사해 실제 키를 입력합니다. 실제
+`.streamlit/secrets.toml`은 Git에서 제외됩니다.
+
+```powershell
+Copy-Item .streamlit\secrets.toml.example .streamlit\secrets.toml
+```
+
+```toml
+FOOTBALL_DATA_API_KEY = "발급받은_API_키"
+```
+
+환경변수 `FOOTBALL_DATA_API_KEY`도 지원합니다. Streamlit Community Cloud에서는 앱의
+**Settings → Secrets**에 같은 TOML 항목을 저장합니다. 앱은 리그·시즌 단위 응답을
+15분간 캐시해 반복 호출을 줄이며, API 429 제한·인증·응답 누락 오류를 한국어로
+안내합니다. 오류가 발생해도 기존 CSV 업로드와 가상 데모는 계속 사용할 수 있습니다.
+
 ## 모델 계산 방식
 
 1. 입력 기대득점에 홈 어드밴티지를 포함한 Elo 기대승률을 완만한 지수 배율로 적용합니다.
@@ -82,6 +114,18 @@ uv venv --python 3.12.13 .venv
 3. 0-0, 0-1, 1-0, 1-1 셀에 Dixon–Coles `rho` 보정을 적용합니다.
 4. 10골 초과 꼬리를 제외한 행렬을 다시 정규화해 홈승·무승부·원정승 합계를 100%로 맞춥니다.
 5. 적정 배당은 각 결과 확률의 역수로 계산합니다.
+
+실제 데이터 모드에서는 다음 순서로 입력 전력을 만듭니다.
+
+1. 선택한 시즌 결과 중 각 예측 경기의 킥오프보다 이른 `FINISHED` 경기만 사용합니다.
+2. 팀별 최근 5·10경기 성적, 최근 10경기 평균 득점·실점과 최근 홈·원정 성적을 분리합니다.
+3. 결과를 시간순으로 처리해 모든 팀을 1500에서 시작하는 Elo를 갱신합니다.
+4. 리그 홈·원정 득점 평균과 팀의 최근 홈·원정 득실점을 결합합니다. 표본이 적을 때는
+   리그 평균 쪽으로 수축해 과도한 값을 줄입니다.
+5. 전체 경기와 해당 장소 표본 수가 적으면 불확실성을 `보통` 또는 `높음`으로 표시합니다.
+
+선발, 결장자, 전술, 날씨, 실측 xG는 football-data.org 기본 응답에 없으므로 만들거나
+추정 근거인 것처럼 표시하지 않습니다.
 
 표시 확률은 소수 둘째 자리에서 반올림하되 최대 나머지법으로 각 경기의 세 결과 합계가
 항상 100.00%가 되게 합니다.
@@ -114,14 +158,15 @@ uv venv --python 3.12.13 .venv
 
 테스트는 확률 합계, Dixon–Coles 보정, Elo 방향성, 적정 배당·기대수익률 공식,
 한국어/CP949 CSV, 14경기 가상 데이터, top-k와 소규모 전수조사의 일치, 조합 검색의
-메모리 경계를 확인합니다.
+메모리 경계를 확인합니다. 실제 API는 mock 응답으로 인증 헤더·요청 한도·403·429·필수
+필드 누락·점수 누락·희소 표본을 검증합니다. 예측 경기 이후 결과를 추가해도 입력 전력과
+기대득점이 바뀌지 않는 회귀 테스트로 미래 정보 누수를 점검합니다.
 
 ## Streamlit Community Cloud와 비밀값
 
-저장소의 `app.py`를 진입 파일로 선택하면 됩니다. 현재 MVP에는 API 키가 없습니다.
-향후 API를 연결할 때 키를 코드나 CSV에 저장하지 말고 Streamlit Community Cloud의
-Secrets 또는 로컬 `.streamlit/secrets.toml`을 사용하세요. `secrets.toml`은 Git에서
-제외됩니다.
+저장소의 `app.py`를 진입 파일로 선택하면 됩니다. API 키는 코드나 CSV에 저장하지 말고
+Streamlit Community Cloud의 Secrets 또는 로컬 `.streamlit/secrets.toml`을 사용하세요.
+`secrets.toml`은 Git에서 제외됩니다.
 
 배포 화면의 **Advanced settings**에서 로컬 검증 버전과 같은 Python 3.12를 선택합니다.
 진입 파일은 저장소 루트의 `app.py`입니다. 이 MVP는 데이터베이스를 사용하지 않으며,

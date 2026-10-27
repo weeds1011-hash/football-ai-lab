@@ -2,10 +2,23 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+import os
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+from streamlit.errors import StreamlitSecretNotFoundError
+
+from football_data import (
+    FREE_COMPETITIONS,
+    FootballDataClient,
+    FootballDataError,
+    FootballDataRateLimitError,
+    SEOUL_TIMEZONE,
+    build_real_match_bundle,
+    season_start_year,
+)
 
 from models import (
     ModelConfig,
@@ -40,6 +53,10 @@ st.markdown(
         display: inline-block; padding: .35rem .65rem; border-radius: 999px;
         background: #fff3cd; color: #664d03; font-weight: 700; margin-bottom: .75rem;
     }
+    .real-label {
+        display: inline-block; padding: .35rem .65rem; border-radius: 999px;
+        background: #d1e7dd; color: #0f5132; font-weight: 700; margin-bottom: .75rem;
+    }
     @media (max-width: 640px) {
         .block-container {padding: .75rem .65rem 2rem;}
         h1 {font-size: 1.75rem !important;}
@@ -59,17 +76,143 @@ def load_demo_data() -> pd.DataFrame:
     return pd.read_csv(DEMO_CSV, encoding="utf-8-sig")
 
 
+@st.cache_data(ttl=900, show_spinner=False)
+def load_real_api_payload(
+    competition_code: str, season: int, *, _api_key: str
+) -> tuple[dict[str, object], dict[str, int | None]]:
+    """같은 리그·시즌 API 응답을 15분간 캐시한다."""
+
+    response = FootballDataClient(_api_key).competition_matches(
+        competition_code, season
+    )
+    return dict(response.data), {
+        "remaining": response.rate_limit.remaining_per_minute,
+        "reset_seconds": response.rate_limit.reset_seconds,
+    }
+
+
+def football_data_api_key() -> str | None:
+    environment_value = os.getenv("FOOTBALL_DATA_API_KEY", "").strip()
+    if environment_value:
+        return environment_value
+    try:
+        secret_value = str(st.secrets.get("FOOTBALL_DATA_API_KEY", "")).strip()
+    except (FileNotFoundError, KeyError, StreamlitSecretNotFoundError):
+        return None
+    return secret_value or None
+
+
+def real_api_data(prefix: str) -> tuple[pd.DataFrame | None, str]:
+    st.markdown('<span class="real-label">실제 일정·결과</span>', unsafe_allow_html=True)
+    st.caption(
+        "football-data.org 실제 일정·최종 스코어를 사용합니다. 기대득점은 실측 xG가 아니라 "
+        "과거 득실점으로 계산한 모델 추정치입니다."
+    )
+    selected_date = st.date_input(
+        "경기 날짜 (한국시간)",
+        value=datetime.now(SEOUL_TIMEZONE).date(),
+        key=f"{prefix}_api_date",
+    )
+    competition = st.selectbox(
+        "리그",
+        FREE_COMPETITIONS,
+        format_func=lambda item: item.label,
+        key=f"{prefix}_api_competition",
+    )
+    selected_season = season_start_year(selected_date, competition.code)
+    st.caption(f"API 조회 시즌 시작 연도: {selected_season} · 동일 조회는 15분간 캐시됩니다.")
+
+    api_key = football_data_api_key()
+    if not api_key:
+        st.warning(
+            "football-data.org API 키가 설정되지 않았습니다. 로컬 `.streamlit/secrets.toml` "
+            "또는 Streamlit Cloud Secrets에 `FOOTBALL_DATA_API_KEY`를 설정하세요. "
+            "그 전에는 CSV 업로드를 사용할 수 있습니다."
+        )
+        return None, "실제 일정·결과 / 모델 추정 기대득점"
+
+    state_key = f"{prefix}_real_api_bundle"
+    if st.button("실제 경기 목록 불러오기", type="primary", key=f"{prefix}_api_load"):
+        try:
+            with st.spinner("실제 경기와 이전 결과를 불러오는 중입니다..."):
+                payload, rate_limit = load_real_api_payload(
+                    competition.code, selected_season, _api_key=api_key
+                )
+                bundle = build_real_match_bundle(
+                    payload,
+                    target_date=selected_date,
+                    now=datetime.now(SEOUL_TIMEZONE),
+                )
+            st.session_state[state_key] = {
+                "date": selected_date.isoformat(),
+                "competition_code": competition.code,
+                "bundle": bundle,
+                "rate_limit": rate_limit,
+            }
+        except FootballDataRateLimitError as exc:
+            retry_message = (
+                f" 약 {exc.retry_after_seconds}초 후 재시도할 수 있습니다."
+                if exc.retry_after_seconds is not None
+                else ""
+            )
+            st.error(f"{exc}{retry_message} CSV 업로드는 계속 사용할 수 있습니다.")
+        except FootballDataError as exc:
+            st.error(f"{exc} CSV 업로드는 계속 사용할 수 있습니다.")
+
+    stored = st.session_state.get(state_key)
+    if not isinstance(stored, dict):
+        st.info("날짜와 리그를 선택한 뒤 실제 경기 목록을 불러오세요.")
+        return None, "실제 일정·결과 / 모델 추정 기대득점"
+    if (
+        stored.get("date") != selected_date.isoformat()
+        or stored.get("competition_code") != competition.code
+    ):
+        st.info("선택값이 바뀌었습니다. 실제 경기 목록을 다시 불러오세요.")
+        return None, "실제 일정·결과 / 모델 추정 기대득점"
+
+    bundle = stored["bundle"]
+    rate_limit = stored["rate_limit"]
+    if bundle.input_frame.empty:
+        st.info(
+            "선택 날짜에 아직 시작하지 않은 경기가 없습니다. 다른 날짜를 선택하거나 CSV를 사용하세요."
+        )
+        return None, "실제 일정·결과 / 모델 추정 기대득점"
+
+    st.success(
+        f"실제 경기 {len(bundle.input_frame)}개를 준비했습니다. "
+        f"예측 시점 이전 완료 경기 {bundle.history_match_count}개만 전력 계산에 사용했습니다."
+    )
+    if rate_limit.get("remaining") is not None:
+        st.caption(
+            f"API 분당 잔여 요청: {rate_limit['remaining']}회 · 누락되어 건너뛴 경기: "
+            f"{bundle.skipped_match_count}개"
+        )
+    with st.expander("팀 전력 및 기대득점 산출 근거", expanded=True):
+        st.dataframe(bundle.evidence_frame, width="stretch", hide_index=True)
+        st.caption(
+            "불확실성은 이용 가능한 전체·홈/원정 경기 수로 표시합니다. "
+            "실제 라인업, 부상자, 실측 xG는 포함하지 않습니다."
+        )
+    return bundle.input_frame, "실제 일정·결과 / 모델 추정 기대득점"
+
+
 def uploaded_or_demo_data(prefix: str) -> tuple[pd.DataFrame | None, str]:
     source = st.radio(
         "데이터 선택",
-        ("14경기 가상 데모", "CSV 업로드"),
+        ("14경기 가상 데모", "실제 데이터 API", "CSV 업로드"),
         horizontal=True,
         key=f"{prefix}_source",
     )
+    active_source_key = f"{prefix}_active_source"
+    if st.session_state.get(active_source_key) != source:
+        st.session_state[active_source_key] = source
+        st.session_state.pop("proto_result" if prefix == "proto" else "toto_bundle", None)
     if source == "14경기 가상 데모":
         st.markdown('<span class="data-label">가상 데이터</span>', unsafe_allow_html=True)
         st.caption("팀·기대득점·Elo·배당은 기능 시험을 위해 만든 값이며 실제 경기가 아닙니다.")
         return load_demo_data(), "가상 데이터"
+    if source == "실제 데이터 API":
+        return real_api_data(prefix)
 
     uploaded = st.file_uploader(
         "경기 CSV 파일",
@@ -171,24 +314,33 @@ with proto_tab:
         st.success(f"{len(proto_result)}경기 분석을 완료했습니다.")
         show_probability_table(proto_result)
         st.markdown("#### 적정 배당과 기대수익률")
+        expected_return_columns = [
+            "홈승 기대수익률(%)",
+            "무승부 기대수익률(%)",
+            "원정승 기대수익률(%)",
+        ]
+        odds_columns = [
+            "경기번호",
+            "홈승 적정배당",
+            "무승부 적정배당",
+            "원정승 적정배당",
+        ]
+        has_market_odds = proto_result[expected_return_columns].notna().any(axis=None)
+        display_columns = odds_columns + (
+            expected_return_columns if has_market_odds else []
+        ) + ["데이터 구분"]
         st.dataframe(
-            proto_result.loc[
-                :,
-                [
-                    "경기번호",
-                    "홈승 적정배당",
-                    "무승부 적정배당",
-                    "원정승 적정배당",
-                    "홈승 기대수익률(%)",
-                    "무승부 기대수익률(%)",
-                    "원정승 기대수익률(%)",
-                    "데이터 구분",
-                ],
-            ],
+            proto_result.loc[:, display_columns],
             width="stretch",
             hide_index=True,
         )
-        st.caption("기대수익률 = 모델 확률 × 입력 배당 − 1. 양수라도 실제 수익을 보장하지 않습니다.")
+        if has_market_odds:
+            st.caption(
+                "기대수익률 = 모델 확률 × 입력 배당 − 1. "
+                "양수라도 실제 수익을 보장하지 않습니다."
+            )
+        else:
+            st.info("실제 배당 입력이 없어 기대수익률 계산을 생략했습니다.")
         st.download_button(
             "분석 결과 CSV 다운로드",
             data=result_csv_bytes(proto_result),
@@ -262,6 +414,19 @@ with st.expander("CSV 형식 안내"):
         선택 열은 `경기번호`, `홈 Elo`, `원정 Elo`, `홈승 배당`, `무승부 배당`,
         `원정승 배당`, `데이터 구분`입니다. 영문 헤더도 지원합니다. 배당이 없으면
         기대수익률은 빈 값으로 표시됩니다.
+        """
+    )
+
+with st.expander("실제 데이터 API 안내"):
+    st.markdown(
+        """
+        football-data.org v4 무료 플랜의 실제 일정·최종 결과·팀 식별 정보를 사용합니다.
+        무료 플랜은 분당 요청 제한이 있으므로 동일 리그·시즌 응답을 15분간 캐시합니다.
+        API 오류나 제한 초과 시에는 **CSV 업로드**로 계속 분석할 수 있습니다.
+
+        API가 제공한 최종 스코어와 앱이 계산한 기대득점은 서로 다른 데이터입니다.
+        앱의 기대득점은 예측 경기 시작 전 완료 결과만 사용한 모델 추정치이며 실측 xG가
+        아닙니다. 무료 응답에 배당이 없으면 기대수익률은 계산하지 않습니다.
         """
     )
 
