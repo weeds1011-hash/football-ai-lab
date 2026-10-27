@@ -93,6 +93,9 @@ class HistoricalMatch:
     away_team: str
     home_goals: int
     away_goals: int
+    finished_at: datetime | None = None
+    source: str = ""
+    acquired_at: datetime | None = None
 
 
 @dataclass(frozen=True)
