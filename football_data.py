@@ -268,6 +268,7 @@ def build_real_match_bundle(
     input_rows: list[dict[str, object]] = []
     evidence_rows: list[dict[str, object]] = []
     competition_name = _nested_string(payload, "competition", "name") or "선택 리그"
+    competition_code = _nested_string(payload, "competition", "code") or ""
 
     for raw_fixture, kickoff in fixtures:
         teams = _fixture_teams(raw_fixture)
@@ -301,6 +302,10 @@ def build_real_match_bundle(
         input_rows.append(
             {
                 "경기번호": match_id,
+                "경기시각(KST)": local_kickoff.strftime("%Y-%m-%d %H:%M"),
+                "대회코드": competition_code,
+                "홈팀 ID": home_id,
+                "원정팀 ID": away_id,
                 "홈팀": home_name,
                 "원정팀": away_name,
                 "홈 기대득점": round(home_xg, 3),

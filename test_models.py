@@ -200,3 +200,15 @@ def test_streamlit_real_api_mode_without_key_keeps_csv_fallback() -> None:
     app.radio(key="proto_source").set_value("실제 데이터 API").run(timeout=30)
     assert not list(app.exception)
     assert any("API 키가 설정되지 않았습니다" in item.value for item in app.warning)
+
+
+def test_streamlit_betman_modes_require_user_file_without_exception() -> None:
+    app = AppTest.from_file(str(ROOT / "app.py")).run(timeout=30)
+
+    app.radio(key="proto_source").set_value("베트맨 실제 경기").run(timeout=30)
+    assert not list(app.exception)
+    assert any("자동 스크래핑" in item.value for item in app.warning)
+
+    app.radio(key="toto_source").set_value("베트맨 승무패 회차").run(timeout=30)
+    assert not list(app.exception)
+    assert sum("자동 스크래핑" in item.value for item in app.warning) >= 2

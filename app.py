@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import hashlib
 import os
 from pathlib import Path
 
@@ -10,6 +11,21 @@ import pandas as pd
 import streamlit as st
 from streamlit.errors import StreamlitSecretNotFoundError
 
+from betman_data import (
+    BETMAN_HOME_URL,
+    BETMAN_TERMS_URL,
+    MARKET_1X2,
+    available_rounds,
+    betman_template_csv,
+    display_betman_frame,
+    latest_retrieved_at,
+    link_betman_matches,
+    read_betman_file,
+    read_team_alias_file,
+    select_round,
+    team_alias_template_csv,
+    validate_toto_round,
+)
 from football_data import (
     FREE_COMPETITIONS,
     FootballDataClient,
@@ -32,6 +48,7 @@ from models import (
 
 APP_DIR = Path(__file__).resolve().parent
 DEMO_CSV = APP_DIR / "data" / "demo_14_matches.csv"
+FREE_COMPETITION_BY_CODE = {item.code: item for item in FREE_COMPETITIONS}
 
 st.set_page_config(
     page_title="Football AI Lab",
@@ -74,6 +91,18 @@ st.markdown(
 @st.cache_data
 def load_demo_data() -> pd.DataFrame:
     return pd.read_csv(DEMO_CSV, encoding="utf-8-sig")
+
+
+@st.cache_data(show_spinner=False)
+def load_betman_upload(payload: bytes, filename: str) -> pd.DataFrame:
+    """사용자가 제공한 베트맨 CSV/XLSX를 파일 내용 기준으로 캐시한다."""
+
+    return read_betman_file(payload, filename)
+
+
+@st.cache_data(show_spinner=False)
+def load_team_alias_upload(payload: bytes, filename: str) -> pd.DataFrame:
+    return read_team_alias_file(payload, filename)
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -196,10 +225,261 @@ def real_api_data(prefix: str) -> tuple[pd.DataFrame | None, str]:
     return bundle.input_frame, "실제 일정·결과 / 모델 추정 기대득점"
 
 
+def link_betman_to_model(
+    selected_frame: pd.DataFrame,
+    alias_frame: pd.DataFrame | None,
+    api_key: str,
+):
+    """선택 경기 날짜·대회만 조회해 베트맨 행을 모델 입력으로 연결한다."""
+
+    fixture_frames: list[pd.DataFrame] = []
+    supported_codes = set(FREE_COMPETITION_BY_CODE)
+    groups = selected_frame.loc[:, ["competition_code", "kickoff_kst"]].copy()
+    groups["competition_code"] = groups["competition_code"].astype(str).str.upper()
+    groups["target_date"] = groups["kickoff_kst"].map(lambda value: value.date())
+    groups = groups.loc[groups["competition_code"].isin(supported_codes)].drop_duplicates(
+        ["competition_code", "target_date"]
+    )
+
+    for _, group in groups.iterrows():
+        code = group["competition_code"]
+        target_date = group["target_date"]
+        season = season_start_year(target_date, code)
+        payload, _ = load_real_api_payload(code, season, _api_key=api_key)
+        bundle = build_real_match_bundle(
+            payload,
+            target_date=target_date,
+            now=datetime.now(SEOUL_TIMEZONE),
+        )
+        if not bundle.input_frame.empty:
+            fixture_frames.append(bundle.input_frame)
+
+    fixtures = (
+        pd.concat(fixture_frames, ignore_index=True)
+        if fixture_frames
+        else pd.DataFrame()
+    )
+    return link_betman_matches(
+        selected_frame,
+        fixtures,
+        alias_frame=alias_frame,
+        supported_codes=supported_codes,
+    )
+
+
+def betman_user_file_data(prefix: str) -> tuple[pd.DataFrame | None, str]:
+    """베트맨 자동 수집 대신 사용자 제공 회차 파일을 안전하게 처리한다."""
+
+    is_toto = prefix == "toto"
+    st.markdown(
+        '<span class="real-label">베트맨 실제 자료 · 사용자 파일</span>',
+        unsafe_allow_html=True,
+    )
+    st.warning(
+        "베트맨 공식 API와 자동 수집 허가를 확인하지 못해 사이트를 자동 스크래핑하지 않습니다. "
+        "이용 권한을 확인해 직접 확보한 CSV/XLSX만 업로드하세요."
+    )
+    st.caption(
+        "출처: betman.co.kr · 파일의 회차, 경기번호, 일정, 배당·투표율과 조회 기준시각은 "
+        "업로드한 자료를 그대로 사용하며 임의 값을 만들지 않습니다."
+    )
+    template_left, template_right = st.columns(2)
+    with template_left:
+        st.download_button(
+            "베트맨 입력 템플릿",
+            data=betman_template_csv(),
+            file_name="betman_round_template.csv",
+            mime="text/csv",
+            key=f"{prefix}_betman_template",
+        )
+    with template_right:
+        st.download_button(
+            "팀명 매핑 템플릿",
+            data=team_alias_template_csv(),
+            file_name="betman_team_alias_template.csv",
+            mime="text/csv",
+            key=f"{prefix}_betman_alias_template",
+        )
+
+    uploaded = st.file_uploader(
+        "베트맨 회차 CSV 또는 XLSX",
+        type=("csv", "xlsx"),
+        help="베트맨 자료의 사용·재사용 권한은 업로드한 사용자가 확인해야 합니다.",
+        key=f"{prefix}_betman_upload",
+    )
+    if uploaded is None:
+        st.info("회차 파일을 업로드하면 회차 선택과 팀 매칭을 진행할 수 있습니다.")
+        return None, "베트맨 사용자 제공 자료"
+
+    payload = uploaded.getvalue()
+    try:
+        frame = load_betman_upload(payload, uploaded.name)
+    except ValueError as exc:
+        st.error(str(exc))
+        return None, "베트맨 사용자 제공 자료"
+
+    product_text = frame["product"].str.lower()
+    if is_toto and product_text.str.contains("승무패", regex=False).any():
+        frame = frame.loc[product_text.str.contains("승무패", regex=False)].copy()
+    elif not is_toto and product_text.str.contains("프로토", regex=False).any():
+        frame = frame.loc[product_text.str.contains("프로토", regex=False)].copy()
+    if frame.empty:
+        st.error("선택한 분석 탭에 해당하는 상품 행이 없습니다.")
+        return None, "베트맨 사용자 제공 자료"
+
+    rounds = available_rounds(frame)
+    selected_round = st.selectbox("회차", rounds, key=f"{prefix}_betman_round")
+    round_frame = select_round(frame, selected_round)
+
+    if not is_toto:
+        sports = round_frame["sport"].drop_duplicates().tolist()
+        default_sport_index = next(
+            (index for index, value in enumerate(sports) if "축구" in value), 0
+        )
+        selected_sport = st.selectbox(
+            "종목",
+            sports,
+            index=default_sport_index,
+            key=f"{prefix}_betman_sport",
+        )
+        round_frame = round_frame.loc[round_frame["sport"] == selected_sport].copy()
+        dates = sorted({value.date().isoformat() for value in round_frame["kickoff_kst"]})
+        selected_date = st.selectbox(
+            "경기 날짜",
+            ["전체", *dates],
+            key=f"{prefix}_betman_date",
+        )
+        if selected_date != "전체":
+            round_frame = round_frame.loc[
+                round_frame["kickoff_kst"].map(lambda value: value.date().isoformat())
+                == selected_date
+            ].copy()
+
+    st.caption(f"파일 갱신 기준시각: {latest_retrieved_at(round_frame)}")
+    st.dataframe(display_betman_frame(round_frame), width="stretch", hide_index=True)
+
+    ineligible = round_frame.loc[round_frame["market_type"] != MARKET_1X2]
+    if not ineligible.empty:
+        st.info(
+            f"핸디캡·언더오버·기타 시장 {len(ineligible)}개는 별도 모델이 없어 "
+            "목록만 표시하며 1X2 분석에 연결하지 않습니다."
+        )
+
+    eligible = round_frame.loc[round_frame["market_type"] == MARKET_1X2].copy()
+    if is_toto:
+        try:
+            validate_toto_round(eligible)
+        except ValueError as exc:
+            st.error(str(exc))
+            st.dataframe(
+                pd.DataFrame(
+                    {
+                        "확보 경기번호": eligible["match_no"].tolist(),
+                    }
+                ),
+                width="stretch",
+                hide_index=True,
+            )
+            return None, "베트맨 사용자 제공 자료"
+        selected_frame = eligible
+    else:
+        options = eligible.index.tolist()
+        chosen = st.multiselect(
+            "AI 분석할 일반 승무패 경기",
+            options,
+            default=options,
+            format_func=lambda index: (
+                f"{int(eligible.loc[index, 'match_no'])}번 · "
+                f"{eligible.loc[index, 'home_team']} vs {eligible.loc[index, 'away_team']}"
+            ),
+            key=f"{prefix}_betman_matches",
+        )
+        selected_frame = eligible.loc[chosen].copy() if chosen else eligible.iloc[0:0].copy()
+        if selected_frame.empty:
+            st.info("일반 승무패 경기를 한 개 이상 선택하세요.")
+            return None, "베트맨 사용자 제공 자료"
+
+    alias_upload = st.file_uploader(
+        "확인된 팀명 매핑 CSV/XLSX (선택)",
+        type=("csv", "xlsx"),
+        help="유사도 자동 매칭은 하지 않습니다. 베트맨 팀명과 football-data 팀명을 직접 확인해 입력하세요.",
+        key=f"{prefix}_betman_alias_upload",
+    )
+    alias_frame = None
+    alias_payload = b""
+    if alias_upload is not None:
+        alias_payload = alias_upload.getvalue()
+        try:
+            alias_frame = load_team_alias_upload(alias_payload, alias_upload.name)
+        except ValueError as exc:
+            st.error(str(exc))
+            return None, "베트맨 사용자 제공 자료"
+
+    signature_source = (
+        payload
+        + alias_payload
+        + selected_round.encode("utf-8")
+        + ",".join(str(value) for value in selected_frame.index).encode("ascii")
+    )
+    signature = hashlib.sha256(signature_source).hexdigest()
+    state_key = f"{prefix}_betman_link"
+    api_key = football_data_api_key()
+    button_label = (
+        "football-data.org 매칭 및 14경기 준비"
+        if is_toto
+        else "football-data.org 매칭 및 선택 경기 준비"
+    )
+    if st.button(button_label, type="primary", key=f"{prefix}_betman_link_run"):
+        if not api_key:
+            st.error("football-data.org API 키가 없어 전력 매칭을 실행할 수 없습니다.")
+        else:
+            try:
+                with st.spinner("공식 일정과 이전 결과를 조회하고 팀을 확인하는 중입니다..."):
+                    link_result = link_betman_to_model(selected_frame, alias_frame, api_key)
+                st.session_state[state_key] = {
+                    "signature": signature,
+                    "selected_count": len(selected_frame),
+                    "result": link_result,
+                }
+            except FootballDataRateLimitError as exc:
+                st.error(f"football-data.org 요청 한도를 초과했습니다: {exc}")
+            except (FootballDataError, ValueError) as exc:
+                st.error(f"경기 매칭 오류: {exc}")
+
+    stored = st.session_state.get(state_key)
+    if not isinstance(stored, dict) or stored.get("signature") != signature:
+        st.info("회차와 경기를 확인한 뒤 football-data.org 매칭 버튼을 누르세요.")
+        return None, "베트맨 사용자 제공 자료"
+
+    link_result = stored["result"]
+    st.markdown("#### 팀·일정 매칭 결과")
+    st.dataframe(link_result.status_frame, width="stretch", hide_index=True)
+    matched = link_result.matched_count
+    selected_count = int(stored["selected_count"])
+    if is_toto and matched != 14:
+        st.error(
+            f"14경기 중 {matched}경기만 안전하게 매칭됐습니다. "
+            "매칭 실패·미지원 경기를 해결하기 전에는 조합 분석을 실행하지 않습니다."
+        )
+        return None, "베트맨 사용자 제공 자료"
+    if matched == 0:
+        st.error("안전하게 매칭된 경기가 없습니다. 대회코드와 팀명 매핑을 확인하세요.")
+        return None, "베트맨 사용자 제공 자료"
+    if matched < selected_count:
+        st.warning(
+            f"선택한 {selected_count}경기 중 {matched}경기만 분석에 연결합니다. "
+            "나머지는 임의 추정하지 않았습니다."
+        )
+    else:
+        st.success(f"{matched}경기를 football-data.org 전력 자료와 안전하게 연결했습니다.")
+    return link_result.model_frame, "베트맨 사용자 파일 + football-data.org 모델 추정"
+
+
 def uploaded_or_demo_data(prefix: str) -> tuple[pd.DataFrame | None, str]:
+    betman_option = "베트맨 승무패 회차" if prefix == "toto" else "베트맨 실제 경기"
     source = st.radio(
         "데이터 선택",
-        ("14경기 가상 데모", "실제 데이터 API", "CSV 업로드"),
+        ("14경기 가상 데모", "실제 데이터 API", betman_option, "CSV 업로드"),
         horizontal=True,
         key=f"{prefix}_source",
     )
@@ -207,12 +487,15 @@ def uploaded_or_demo_data(prefix: str) -> tuple[pd.DataFrame | None, str]:
     if st.session_state.get(active_source_key) != source:
         st.session_state[active_source_key] = source
         st.session_state.pop("proto_result" if prefix == "proto" else "toto_bundle", None)
+        st.session_state.pop(f"{prefix}_betman_link", None)
     if source == "14경기 가상 데모":
         st.markdown('<span class="data-label">가상 데이터</span>', unsafe_allow_html=True)
         st.caption("팀·기대득점·Elo·배당은 기능 시험을 위해 만든 값이며 실제 경기가 아닙니다.")
         return load_demo_data(), "가상 데이터"
     if source == "실제 데이터 API":
         return real_api_data(prefix)
+    if source == betman_option:
+        return betman_user_file_data(prefix)
 
     uploaded = st.file_uploader(
         "경기 CSV 파일",
@@ -430,7 +713,24 @@ with st.expander("실제 데이터 API 안내"):
         """
     )
 
+with st.expander("베트맨 파일 연동 안내"):
+    st.markdown(
+        f"""
+        - 공식 사이트: [{BETMAN_HOME_URL}]({BETMAN_HOME_URL})
+        - 이용약관: [{BETMAN_TERMS_URL}]({BETMAN_TERMS_URL})
+        - 공개 개발자 API 및 자동 수집 허가 문서는 확인되지 않았습니다.
+        - 이용약관 제13조에는 사전 승낙 없이 서비스에서 얻은 정보를 서비스 외
+          목적으로 복제·제공하는 행위를 제한하는 내용이 있습니다.
+
+        따라서 앱은 베트맨 사이트를 자동 로그인하거나 스크래핑하지 않습니다.
+        사용자가 적법하게 확보한 CSV/XLSX만 회차별로 불러옵니다. 일반 승무패만
+        기존 1X2 모델에 연결하며 핸디캡·언더오버·기타 시장은 분석하지 않습니다.
+        팀명이 불확실하거나 중복 후보가 있으면 자동 연결하지 않습니다.
+        """
+    )
+
 st.caption("Football data provided by the Football-Data.org API")
+st.caption("Betman round information: user-provided file only (no automated scraping)")
 
 with st.expander("갤럭시 홈 화면에 추가"):
     st.markdown(
