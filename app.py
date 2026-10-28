@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 import hashlib
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -81,7 +82,7 @@ def load_demo_data() -> pd.DataFrame:
 @st.cache_data(ttl=900, show_spinner=False)
 def load_real_api_payload(
     competition_code: str, season: int, *, _api_key: str
-) -> tuple[dict[str, object], dict[str, int | None]]:
+) -> tuple[dict[str, object], dict[str, object]]:
     """같은 리그·시즌 API 응답을 15분간 캐시한다."""
 
     response = FootballDataClient(_api_key).competition_matches(
@@ -90,6 +91,7 @@ def load_real_api_payload(
     return dict(response.data), {
         "remaining": response.rate_limit.remaining_per_minute,
         "reset_seconds": response.rate_limit.reset_seconds,
+        "observed_at": datetime.now(SEOUL_TIMEZONE).isoformat(),
     }
 
 
@@ -144,6 +146,7 @@ def real_api_data(prefix: str) -> tuple[pd.DataFrame | None, str]:
                     payload,
                     target_date=selected_date,
                     now=datetime.now(SEOUL_TIMEZONE),
+                    observed_at=datetime.fromisoformat(str(rate_limit["observed_at"])),
                 )
             st.session_state[state_key] = {
                 "date": selected_date.isoformat(),
@@ -184,6 +187,9 @@ def real_api_data(prefix: str) -> tuple[pd.DataFrame | None, str]:
         f"실제 경기 {len(bundle.input_frame)}개를 준비했습니다. "
         f"예측 시점 이전 완료 경기 {bundle.history_match_count}개만 전력 계산에 사용했습니다."
     )
+    st.caption("표시한 경기들은 현재 공통 분석 기준시각의 정보만 사용합니다. API의 종료 상태는 조회시각에 확인했으며 정확한 종료시각은 제공하지 않습니다.")
+    if not bundle.evidence_frame.empty and (bundle.evidence_frame['데이터 충분성'] == '낮음').any():
+        st.warning("경기 이력이 부족한 팀이 있습니다. 데이터 충분성은 예측 확률이나 적중 보장과 다릅니다.")
     if rate_limit.get("remaining") is not None:
         st.caption(
             f"API 분당 잔여 요청: {rate_limit['remaining']}회 · 누락되어 건너뛴 경기: "
@@ -209,6 +215,7 @@ def uploaded_or_demo_data(prefix: str) -> tuple[pd.DataFrame | None, str]:
     if st.session_state.get(active_source_key) != source:
         st.session_state[active_source_key] = source
         st.session_state.pop("proto_result" if prefix == "proto" else "toto_bundle", None)
+        st.session_state.pop(f"{prefix}_snapshot", None)
     if source == "14경기 가상 데모":
         st.markdown('<span class="data-label">가상 데이터</span>', unsafe_allow_html=True)
         st.caption("팀·기대득점·Elo·배당은 기능 시험을 위해 만든 값이며 실제 경기가 아닙니다.")
@@ -234,6 +241,22 @@ def uploaded_or_demo_data(prefix: str) -> tuple[pd.DataFrame | None, str]:
 
 def result_csv_bytes(frame: pd.DataFrame) -> bytes:
     return frame.to_csv(index=False).encode("utf-8-sig")
+
+
+def make_prediction_snapshot(inputs: pd.DataFrame, results: pd.DataFrame, data_type: str, config: ModelConfig, prefix: str) -> str:
+    """배당·비밀키를 제외한 분석 입력과 데이터 기준시각을 기록한다."""
+    safe_inputs=inputs.drop(columns=["home_odds", "draw_odds", "away_odds"],errors="ignore")
+    safe_results=results.drop(columns=[c for c in results.columns if '배당' in c or '기대수익률' in c],errors="ignore")
+    state=st.session_state.get(f"{prefix}_real_api_bundle") if data_type.startswith("실제 일정") else None
+    evidence=state['bundle'].evidence_frame if isinstance(state,dict) else pd.DataFrame()
+    timing = ('API 조회 당시 종료 상태를 확인; 기록의 정확한 종료시각은 미제공' if not evidence.empty
+              else '가상 입력' if data_type=='가상 데이터' else '업로드 입력의 당시 가용시각은 미확인')
+    return json.dumps({"생성시각":datetime.now(SEOUL_TIMEZONE).isoformat(),"자료구분":data_type,
+        "입력 시점 검증":timing,
+        "모델":"Elo + Poisson + Dixon–Coles","설정":{"rho":config.dixon_coles_rho,"홈 이점":config.home_advantage_elo},
+        "입력":json.loads(safe_inputs.to_json(orient="records",force_ascii=False)),
+        "결과":json.loads(safe_results.to_json(orient="records",force_ascii=False)),
+        "데이터 기준 및 충분성":json.loads(evidence.to_json(orient="records",force_ascii=False))},ensure_ascii=False,indent=2)
 
 
 def show_input_preview(frame: pd.DataFrame) -> None:
@@ -267,6 +290,7 @@ def show_probability_table(result: pd.DataFrame) -> None:
             ),
         },
     )
+    st.caption("예상 스코어는 가장 가능성이 큰 단일 점수입니다. 승·무·패는 해당하는 여러 스코어의 확률을 합하므로 최우선 결과가 다를 수 있습니다.")
 
 
 st.title("⚽ Football AI Lab")
@@ -304,10 +328,11 @@ with proto_tab:
         show_input_preview(proto_frame)
         if st.button("프로토 분석 실행", type="primary", key="proto_run"):
             try:
-                _, proto_result, _ = analyze_dataframe(
+                proto_inputs, proto_result, _ = analyze_dataframe(
                     proto_frame, config, default_data_type=proto_data_type
                 )
                 st.session_state["proto_result"] = proto_result
+                st.session_state["proto_snapshot"] = make_prediction_snapshot(proto_inputs,proto_result,proto_data_type,config,"proto")
             except ValueError as exc:
                 st.error(f"입력 데이터 오류: {exc}")
 
@@ -350,15 +375,19 @@ with proto_tab:
             mime="text/csv",
             key="proto_download",
         )
+        if st.session_state.get("proto_snapshot"):
+            st.download_button("예측 스냅샷 다운로드",st.session_state["proto_snapshot"],file_name="proto_snapshot.json",mime="application/json",key="proto_snapshot_download")
 
 with toto_tab:
     st.subheader("축구토토 승무패 14경기")
     toto_frame, toto_data_type = uploaded_or_demo_data("toto")
+    if toto_data_type == '사용자 업로드':
+        st.warning('업로드된 예상 득점·Elo의 공통 마감 전 이용 가능 여부는 자동 확인할 수 없습니다. 엄격한 회차 시점 검증이 필요한 경우 과거검증의 시각이 포함된 회차·이력 파일을 사용하세요.')
     if toto_frame is not None:
         show_input_preview(toto_frame)
         if st.button("14경기 조합 분석", type="primary", key="toto_run"):
             try:
-                _, toto_result, toto_analyses = analyze_dataframe(
+                toto_inputs, toto_result, toto_analyses = analyze_dataframe(
                     toto_frame, config, default_data_type=toto_data_type
                 )
                 validate_toto_14(toto_analyses)
@@ -370,6 +399,7 @@ with toto_tab:
                     draw_frame,
                     upset_frame,
                 )
+                st.session_state["toto_snapshot"] = make_prediction_snapshot(toto_inputs,toto_result,toto_data_type,config,"toto")
             except ValueError as exc:
                 st.error(f"입력 데이터 오류: {exc}")
 
@@ -408,6 +438,8 @@ with toto_tab:
             mime="text/csv",
             key="toto_download",
         )
+        if st.session_state.get("toto_snapshot"):
+            st.download_button("14경기 예측 스냅샷 다운로드",st.session_state["toto_snapshot"],file_name="toto_snapshot.json",mime="application/json",key="toto_snapshot_download")
 
 with tactics_tab:
     from tactical_experiment import compare_scenario, exact_match, load_profiles
@@ -564,6 +596,52 @@ with review_tab:
             st.error(f"보고서를 읽을 수 없습니다: {exc}")
     else:
         st.info("이 환경에 검증된 1~30회차 보고서가 없습니다. 로컬 보고서를 생성하면 이 화면에 표시됩니다.")
+
+    st.markdown('### 4대 리그 무승부 연구')
+    research_dir=APP_DIR/'reports'/'local_backtest_2026'/'4대리그_무승부_2026'
+    stats_path=research_dir/'리그별_무승부_결과.csv'
+    model_path=research_dir/'전략별_성능.csv'
+    if stats_path.is_file() and model_path.is_file():
+        st.caption('경기 결과 기술 통계는 2026-07-28부터 조회시각까지입니다. 예측 비교는 확인 가능한 오래된 일부 이력만 사용한 사후 연구이며, 맹검 독립 검증이 아닙니다.')
+        st.dataframe(pd.read_csv(stats_path,encoding='utf-8-sig'),hide_index=True,width='stretch')
+        st.caption('A 기본 최고 확률 · B 기본 확률과 후보 표시 · D 확률을 바꾸지 않은 선택 규칙. C는 충분한 검증 학습 이력이 없어 미실행입니다.')
+        st.dataframe(pd.read_csv(model_path,encoding='utf-8-sig'),hide_index=True,width='stretch')
+        score_path=research_dir/'전략별_경기평가.csv'
+        if score_path.is_file():
+            score_data=pd.read_csv(score_path,encoding='utf-8-sig')
+            if not score_data.empty:
+                score_data['월']=pd.to_datetime(score_data['날짜'],utc=True).dt.tz_convert('Asia/Seoul').dt.strftime('%Y-%m')
+                monthly=score_data.groupby(['월','모델'])['적중'].mean().mul(100).unstack()
+                st.caption('월별 단식 적중률(%) · 확인된 EPL·세리에 A 일부 표본의 사후 비교')
+                st.line_chart(monthly)
+        quality_path=research_dir/'분석가능_데이터품질.csv'
+        if quality_path.is_file():
+            with st.expander('분석 표본의 데이터 충분성'):
+                st.dataframe(pd.read_csv(quality_path,encoding='utf-8-sig'),hide_index=True,width='stretch')
+                coverage_path=research_dir/'이전시즌_이력확보현황.csv'
+                if coverage_path.is_file():
+                    st.caption('2026-01-02 이전에 시작한 이전 시즌의 현재 완료 기록 중 공식 대조한 이력 비율입니다. 미대조 경기의 당시 공개 여부는 확인되지 않았습니다.')
+                    st.dataframe(pd.read_csv(coverage_path,encoding='utf-8-sig'),hide_index=True,width='stretch')
+        detail_path=research_dir/'경기별_무승부_진단.csv'
+        if detail_path.is_file():
+            detail=pd.read_csv(detail_path,encoding='utf-8-sig')
+            if not detail.empty:
+                idx=st.selectbox('연구 경기 상세',list(range(len(detail))),key='four_league_match',
+                    format_func=lambda i: f"{detail.iloc[i]['league']} · {detail.iloc[i]['home_team']} vs {detail.iloc[i]['away_team']}")
+                row=detail.iloc[idx]
+                left,mid,right=st.columns(3)
+                left.metric('홈승',f"{row['홈승 확률']*100:.1f}%")
+                mid.metric('무승부',f"{row['무승부 확률']*100:.1f}%")
+                right.metric('원정승',f"{row['원정승 확률']*100:.1f}%")
+                st.write(f"무승부 후보: {'예' if row['B 후보'] else '아니오'} · 근거: {row['후보 근거']}")
+                kickoff_label=pd.Timestamp(row['kickoff']).tz_convert('Asia/Seoul').strftime('%Y-%m-%d %H:%M')
+                st.caption(f"팀 이력 홈 {row['home_history']}경기 / 원정 {row['away_history']}경기 · "
+                           f"데이터 부족 {'예' if row['insufficient'] else '아니오'} · 경기 시각 {kickoff_label} KST")
+                st.caption('표시된 승·무·패는 기존 모델 확률이며 후보는 별도의 규칙 판단입니다. 사후 분석에는 2026-01-02까지 확인된 일부 과거 이력만 사용했습니다.')
+                if st.toggle('연구 경기 실제 결과 공개',key='four_league_reveal'):
+                    st.write(f"실제 결과: {row['actual']} · 기본 선택: {row['A 선택']} · 선택 규칙 D: {row['D 선택']}")
+    else:
+        st.info('이 환경에는 로컬 4대 리그 연구 결과가 없습니다. 경기 원본은 저장소에 포함되지 않습니다.')
 
     from draw_diagnostics import RESEARCH_NOTICE
     from draw_research_workflow import create_predictions, reveal_results
