@@ -295,7 +295,7 @@ with st.expander("모델 설정", expanded=False):
 
 config = ModelConfig(dixon_coles_rho=rho, home_advantage_elo=float(home_advantage))
 
-proto_tab, toto_tab, year_tab, review_tab = st.tabs(("프로토 분석", "승무패 14경기", "2026 승무패 백테스트", "승무패 과거검증"))
+proto_tab, toto_tab, year_tab, review_tab, tactics_tab = st.tabs(("프로토 분석", "승무패 14경기", "2026 승무패 백테스트", "승무패 과거검증", "전술 가상 실험"))
 
 with proto_tab:
     st.subheader("프로토 경기 분석")
@@ -408,6 +408,66 @@ with toto_tab:
             mime="text/csv",
             key="toto_download",
         )
+
+with tactics_tab:
+    from tactical_experiment import compare_scenario, exact_match, load_profiles
+    from models import normalise_match_dataframe, percentages_summing_to_100
+
+    st.subheader('사용자 전술 자료 가상 실험')
+    st.warning('이 자료는 출처와 측정 시점이 확인되지 않은 사용자 제공 가정입니다. 실측 xG나 선수 정보가 아니며, 결과는 예측 정확도가 검증된 확률이 아닙니다.')
+    st.caption('기존 예측은 유지하며 선택한 한 경기의 가상 시나리오만 비교합니다. 과거 백테스트, 14경기 조합과 실제 데이터에 자동 적용하지 않습니다.')
+    source=st.radio('기존 경기 입력 선택',('프로토 입력','승무패 입력'),horizontal=True,key='tactical_match_source')
+    selected_frame=proto_frame if source=='프로토 입력' else toto_frame
+    uploaded_profiles=st.file_uploader('사용자 전술 프로필 CSV',type='csv',key='tactical_profiles')
+    local_profiles=APP_DIR/'data'/'user_tactical_profiles.csv'
+    if uploaded_profiles is None and not local_profiles.is_file():
+        st.info('전술 프로필 CSV를 올리세요. 이 환경에는 사용자 자료가 저장되어 있지 않습니다.')
+    elif selected_frame is None:
+        st.info('먼저 선택한 분석 탭에서 경기 입력을 준비하세요.')
+    else:
+        try:
+            supplied=pd.read_csv(uploaded_profiles if uploaded_profiles is not None else local_profiles,encoding='utf-8-sig')
+            profiles=load_profiles(supplied)
+            normalized=normalise_match_dataframe(selected_frame)
+            st.caption(f'사용자 제공 {len(profiles)}개 팀 · {profiles.league.nunique()}개 리그 · 출처 및 기준시각 미확인')
+            index=st.selectbox('가상 실험할 경기',list(range(len(normalized))),
+                format_func=lambda i: f"{normalized.iloc[i]['match_id']} · {normalized.iloc[i]['home_team']} vs {normalized.iloc[i]['away_team']}",key='tactical_fixture')
+            fixture=normalized.iloc[index].to_dict()
+            league=st.selectbox('프로필 리그',sorted(profiles.league.unique()),key='tactical_league')
+            league_profiles=profiles[profiles.league==league]
+            options=['직접 선택']+[f"{r['team_name_ko']} ({r['team_name_en']})" for _,r in league_profiles.iterrows()]
+            rows=list(league_profiles.index)
+            home_exact=exact_match(profiles,league,str(fixture['home_team']))
+            away_exact=exact_match(profiles,league,str(fixture['away_team']))
+            home_default=rows.index(home_exact[0])+1 if len(home_exact)==1 else 0
+            away_default=rows.index(away_exact[0])+1 if len(away_exact)==1 else 0
+            home_label=st.selectbox('홈팀 프로필',options,index=home_default,key='tactical_home')
+            away_label=st.selectbox('원정팀 프로필',options,index=away_default,key='tactical_away')
+            if not home_exact or not away_exact:
+                st.info('이름이 정확히 일치하지 않는 팀은 직접 선택해 주세요. 유사한 이름만으로 자동 연결하지 않습니다.')
+            confirmed=st.checkbox('선택한 프로필이 위 경기의 홈팀·원정팀에 각각 해당함을 확인했습니다.',key='tactical_confirm')
+            signature=hashlib.sha256(repr((fixture,home_label,away_label,league,confirmed,config,
+                                          profiles.to_json(orient='split',force_ascii=False))).encode()).hexdigest()
+            if st.button('가상 시나리오 비교',key='tactical_run'):
+                if home_label=='직접 선택' or away_label=='직접 선택':
+                    st.error('홈팀과 원정팀 프로필을 선택하세요.')
+                else:
+                    home=profiles.loc[rows[options.index(home_label)-1]].to_dict()
+                    away=profiles.loc[rows[options.index(away_label)-1]].to_dict()
+                    result=compare_scenario(fixture,home,away,confirmed=confirmed,config=config)
+                    st.session_state['tactical_result']={'signature':signature,'result':result}
+            saved=st.session_state.get('tactical_result')
+            if isinstance(saved,dict) and saved.get('signature')==signature:
+                result=saved['result']
+                b=percentages_summing_to_100(result.baseline); e=percentages_summing_to_100(result.experimental)
+                table=pd.DataFrame([{'구분':'기존 모델','홈승%':b[0],'무%':b[1],'원정승%':b[2],'예상 스코어':result.baseline_score},
+                                    {'구분':'가상 전술 시나리오','홈승%':e[0],'무%':e[1],'원정승%':e[2],'예상 스코어':result.experimental_score}])
+                st.dataframe(table,hide_index=True,width='stretch')
+                st.write(f'가정 배율: 홈 {result.home_multiplier:.3f}, 원정 {result.away_multiplier:.3f} · rho 원안 {result.raw_rho:.3f}, 적용 {result.safe_rho:.3f}')
+                if result.rho_capped: st.info('음수 확률 방지 및 기존 모델 허용 범위 때문에 rho를 제한했습니다.')
+                st.caption('적용한 가정: '+', '.join(result.notes)+' · 검증된 실제 확률이 아닙니다.')
+        except (ValueError,OSError,pd.errors.ParserError) as exc:
+            st.error(f'가상 실험 입력 오류: {exc}')
 
 with year_tab:
     from backtest_2026 import HISTORY_COLUMNS, ROUND_COLUMNS, empty_round_status, run as run_2026_backtest
