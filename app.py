@@ -295,7 +295,7 @@ with st.expander("모델 설정", expanded=False):
 
 config = ModelConfig(dixon_coles_rho=rho, home_advantage_elo=float(home_advantage))
 
-proto_tab, toto_tab, year_tab = st.tabs(("프로토 분석", "승무패 14경기", "2026 승무패 백테스트"))
+proto_tab, toto_tab, year_tab, review_tab = st.tabs(("프로토 분석", "승무패 14경기", "2026 승무패 백테스트", "승무패 과거검증"))
 
 with proto_tab:
     st.subheader("프로토 경기 분석")
@@ -461,6 +461,49 @@ with year_tab:
             st.line_chart(trend)
             st.download_button("경기별 비교 CSV 다운로드", result_csv_bytes(matches), file_name="backtest_2026_matches.csv", mime="text/csv", key="year_download")
     st.caption("검증된 회차만 집계합니다. 당시 이력의 실제 제공 가능 시점, 정정 여부, 투표율과 수익률은 자동 검증하지 않습니다.")
+
+with review_tab:
+    st.subheader("승무패 과거검증")
+    st.caption("2026년 1~30회차 · 과거 시점 사후 재현. 실제 당시 저장된 예측이 아닙니다.")
+    st.warning("확인 가능한 이력만 사용합니다. 오래된 시즌이나 적은 경기 수만 확보된 팀은 신뢰도가 낮습니다. 결과는 수익을 보장하지 않습니다.")
+    report_dir = APP_DIR / "reports"
+    report_paths = {name: report_dir / f"backtest_2026_1_30_{name}.csv" for name in ("rounds", "matches", "top20")}
+    if all(path.is_file() for path in report_paths.values()):
+        try:
+            report_tables = {name: pd.read_csv(path, encoding="utf-8-sig") for name, path in report_paths.items()}
+            report_rounds, report_matches, report_top = (report_tables[name] for name in ("rounds", "matches", "top20"))
+            reveal_review = st.toggle("실제 결과와 성적 공개", key="review_reveal", value=False)
+            status_columns = ["회차", "확보 경기", "백테스트 상태", "사유"]
+            if reveal_review:
+                status_columns += ["AI 단식 적중", "홈승 기준선", "TOP20 최고 적중", "TOP20 정답 포함"]
+            st.dataframe(report_rounds[status_columns].fillna(""), hide_index=True, width="stretch")
+            review_round = st.selectbox("과거 회차 선택", range(1, 31), key="review_round")
+            selected_review = report_matches[report_matches["회차"] == review_round]
+            selected_top = report_top[report_top["회차"] == review_round]
+            if selected_review.empty:
+                st.info("공식 대상 경기 또는 경기 전 이력이 아직 검증되지 않은 회차입니다.")
+            else:
+                prediction_columns = ["번호", "홈팀", "원정팀", "홈승%", "무%", "원정승%", "AI 선택", "예상 스코어", "전력 자료"]
+                st.dataframe(selected_review[prediction_columns + (["실제 스코어", "실제 결과", "적중"] if reveal_review else [])], hide_index=True, width="stretch")
+                if not selected_top.empty:
+                    st.markdown("#### 확률 상위 20개 조합")
+                    top_columns = ["순위", "조합", "확률"] + (["일치 경기수", "일치 등급"] if reveal_review else [])
+                    st.dataframe(selected_top[top_columns], hide_index=True, width="stretch")
+            if reveal_review and not report_matches.empty:
+                st.write(f"완료 {report_matches['회차'].nunique()}회차 · {len(report_matches)}경기 · AI 적중률 {report_matches['적중'].mean()*100:.2f}% · 홈승 기준선 {report_matches['홈승 기준선 적중'].mean()*100:.2f}%")
+                st.write(f"Brier {report_matches['Brier Score'].mean():.4f} · Log Loss {report_matches['Log Loss'].mean():.4f}")
+                st.line_chart(report_matches.groupby("회차")["적중"].mean().mul(100))
+                league = report_matches.groupby("리그")["적중"].agg(["size", "mean"]).rename(columns={"size":"경기 수", "mean":"적중률"})
+                st.markdown("#### 리그별 성적")
+                st.dataframe(league, width="stretch")
+                monthly = report_matches.assign(월=report_matches["날짜"].str[:7]).groupby("월")["적중"].agg(["size", "mean"]).rename(columns={"size":"경기 수", "mean":"적중률"})
+                st.markdown("#### 월별 성적")
+                st.dataframe(monthly, width="stretch")
+                st.download_button("전체 경기 결과 CSV 다운로드", result_csv_bytes(report_matches), file_name="backtest_2026_1_30_matches.csv", mime="text/csv", key="review_download")
+        except (OSError, ValueError, KeyError, pd.errors.ParserError) as exc:
+            st.error(f"보고서를 읽을 수 없습니다: {exc}")
+    else:
+        st.info("이 환경에 검증된 1~30회차 보고서가 없습니다. 로컬 보고서를 생성하면 이 화면에 표시됩니다.")
 
 with st.expander("CSV 형식 안내"):
     st.markdown(

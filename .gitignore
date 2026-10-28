@@ -11,3 +11,5 @@ __pycache__/
 .DS_Store
 Thumbs.db
 reports/local_backtest_2026/
+reports/backtest_2026_1_30_*.csv
+reports/backtest_2026_1_30_summary.md
