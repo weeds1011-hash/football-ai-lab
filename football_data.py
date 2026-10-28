@@ -218,6 +218,8 @@ def build_real_match_bundle(
     target_date: date,
     now: datetime | None = None,
     local_timezone: ZoneInfo = SEOUL_TIMEZONE,
+    observed_at: datetime | None = None,
+    as_of: datetime | None = None,
 ) -> RealMatchBundle:
     """실제 일정과 과거 결과를 기존 분석 입력 및 근거표로 변환한다.
 
@@ -229,8 +231,12 @@ def build_real_match_bundle(
     if not isinstance(raw_matches, list):
         raise FootballDataFormatError("API 응답에 matches 배열이 없습니다.")
     current_time = now or datetime.now(timezone.utc)
-    if current_time.tzinfo is None:
-        raise ValueError("now는 시간대 정보가 있는 datetime이어야 합니다.")
+    observation = observed_at or current_time
+    cutoff = as_of or current_time
+    if any(value.tzinfo is None for value in (current_time, observation, cutoff)):
+        raise ValueError("조회·기준시각은 시간대 정보가 있어야 합니다.")
+    if observation > current_time or cutoff > current_time:
+        raise ValueError("조회 또는 예측 기준시각이 현재보다 늦습니다.")
 
     historical: list[HistoricalMatch] = []
     fixtures: list[tuple[Mapping[str, Any], datetime]] = []
@@ -248,7 +254,17 @@ def build_real_match_bundle(
         status = str(item.get("status") or "")
         if status == FINISHED_STATUS:
             parsed = _parse_finished_match(item, kickoff)
-            if parsed is None:
+            # FINISHED는 조회 시점에 종료를 확인했다는 뜻이며 정확한 종료시각은 제공하지 않는다.
+            # 나중에 조회한 결과를 과거 기준시각의 정보로 소급하지 않는다.
+            updated_raw = item.get("lastUpdated")
+            try:
+                updated = _parse_utc_datetime(updated_raw) if updated_raw else None
+            except FootballDataFormatError:
+                updated = None
+                skipped += 1
+                continue
+            if (parsed is None or kickoff >= cutoff or kickoff >= observation or observation > cutoff
+                    or (updated is not None and updated > observation)):
                 skipped += 1
             else:
                 historical.append(parsed)
@@ -264,6 +280,16 @@ def build_real_match_bundle(
 
     historical.sort(key=lambda match: match.kickoff)
     fixtures.sort(key=lambda item: item[1])
+    past_scheduled = 0
+    for item in raw_matches:
+        if not isinstance(item, Mapping):
+            continue
+        try:
+            if _parse_utc_datetime(item.get("utcDate")) < cutoff:
+                past_scheduled += 1
+        except FootballDataFormatError:
+            continue
+    missing_prior = max(0, past_scheduled - len(historical))
 
     input_rows: list[dict[str, object]] = []
     evidence_rows: list[dict[str, object]] = []
@@ -275,7 +301,15 @@ def build_real_match_bundle(
             skipped += 1
             continue
         home_id, home_name, away_id, away_name = teams
-        prior_matches = [match for match in historical if match.kickoff < kickoff]
+        prior_matches = [match for match in historical if match.kickoff < cutoff and match.kickoff < kickoff]
+        names_by_id: dict[int, set[str]] = {}
+        for match in prior_matches:
+            names_by_id.setdefault(match.home_team_id, set()).add(match.home_team)
+            names_by_id.setdefault(match.away_team_id, set()).add(match.away_team)
+        if any(names_by_id.get(team_id) and (len(names_by_id[team_id]) != 1 or name not in names_by_id[team_id])
+               for team_id,name in ((home_id,home_name),(away_id,away_name))):
+            skipped += 1
+            continue
         ratings = calculate_elo_ratings(prior_matches)
         home_form = calculate_team_form(
             prior_matches,
@@ -317,6 +351,8 @@ def build_real_match_bundle(
             {
                 "경기번호": match_id,
                 "경기시각(KST)": local_kickoff.strftime("%Y-%m-%d %H:%M"),
+                "예측 기준시각(KST)": cutoff.astimezone(local_timezone).strftime("%Y-%m-%d %H:%M:%S"),
+                "API 조회시각(KST)": observation.astimezone(local_timezone).strftime("%Y-%m-%d %H:%M:%S"),
                 "리그": competition_name,
                 "경기": f"{home_name} vs {away_name}",
                 "홈 최근5": home_form.recent5_record,
@@ -329,6 +365,17 @@ def build_real_match_bundle(
                 "원정팀 홈/원정 성적": f"{away_form.home_record} / {away_form.away_record}",
                 "홈 Elo": round(home_form.elo, 1),
                 "원정 Elo": round(away_form.elo, 1),
+                "홈 사용 경기수": home_form.matches_available,
+                "원정 사용 경기수": away_form.matches_available,
+                "리그 사용 경기수": len(prior_matches),
+                "기준시각 이전 미확보·미종료 경기수": missing_prior,
+                "이력 미사용 비율(%)": round(100 * missing_prior / past_scheduled, 1) if past_scheduled else None,
+                "시즌 구분": _nested_string(raw_fixture, "season", "startDate") or "API 선택 시즌; 시작일 미제공",
+                "데이터 충분성": {"높음":"낮음","보통":"보통","낮음":"높음"}[uncertainty],
+                "Elo 초기값 사용": "예" if home_id not in ratings or away_id not in ratings else "아니오",
+                "리그 평균 기본값 사용": "예" if not prior_matches or not sum(m.home_goals for m in prior_matches) or not sum(m.away_goals for m in prior_matches) else "아니오",
+                "팀 ID 확인": "이력 대조" if names_by_id.get(home_id) and names_by_id.get(away_id) else "이력 부족",
+                "자료 확인": "API 조회 시 종료 확인; 정확한 종료시각 미제공",
                 "추정 기대득점": f"{home_xg:.2f} - {away_xg:.2f}",
                 "불확실성": uncertainty,
                 "기대득점 구분": "경기 결과 기반 모델 추정치 (실측 xG 아님)",

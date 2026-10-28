@@ -19,10 +19,8 @@ def _exact_columns(frame: pd.DataFrame, expected: list[str], label: str) -> None
 def checked_history(frame: pd.DataFrame):
     _exact_columns(frame,HISTORY_COLUMNS,'경기 이력')
     frame=frame.reset_index(drop=True)
-    groups=load_history(frame)
-    # 당시 확인 근거 시각과 경기 종료시각 중 더 늦은 시각을 사용한다.
-    return {code:[(m,max(finish,_time(frame.iloc[int(m.match_id)]['acquired_at']))) for m,finish in records]
-            for code,records in groups.items()}
+    # 일반 백테스트와 동일하게 종료 및 확보시각 중 더 늦은 시각을 사용한다.
+    return load_history(frame)
 
 
 def create_predictions(rounds: pd.DataFrame, original_history: pd.DataFrame,

@@ -250,3 +250,46 @@ def test_season_start_year_handles_european_and_calendar_competitions() -> None:
     assert season_start_year(date(2026, 1, 10), "PL") == 2025
     assert season_start_year(date(2026, 8, 10), "PL") == 2026
     assert season_start_year(date(2026, 1, 10), "BSA") == 2026
+
+
+def test_api_excludes_result_updated_after_common_prediction_time() -> None:
+    now=datetime(2026,10,27,0,tzinfo=timezone.utc)
+    fixture=now+timedelta(hours=12)
+    base=_history(fixture)
+    late=_finished_match(999,now-timedelta(minutes=30),1,'실제 홈',2,'실제 원정',9,0)
+    late['lastUpdated']=(now+timedelta(hours=1)).isoformat()
+    payload={'matches':base+[_scheduled_match(500,fixture)]}
+    original=build_real_match_bundle(payload,target_date=date(2026,10,27),now=now)
+    changed=build_real_match_bundle({'matches':payload['matches']+[late]},target_date=date(2026,10,27),now=now)
+    pd.testing.assert_frame_equal(original.input_frame,changed.input_frame)
+    assert changed.evidence_frame.loc[0,'예측 기준시각(KST)']=='2026-10-27 09:00:00'
+    assert changed.evidence_frame.loc[0,'이력 미사용 비율(%)']>0
+
+
+def test_later_api_snapshot_is_not_evidence_for_earlier_cutoff() -> None:
+    now=datetime(2026,10,27,0,tzinfo=timezone.utc)
+    fixture=now+timedelta(hours=12)
+    payload={'matches':_history(fixture)+[_scheduled_match(500,fixture)]}
+    bundle=build_real_match_bundle(payload,target_date=date(2026,10,27),now=now,
+                                   observed_at=now,as_of=now-timedelta(hours=1))
+    assert bundle.history_match_count==0
+    assert bundle.evidence_frame.loc[0,'데이터 충분성']=='낮음'
+    assert bundle.evidence_frame.loc[0,'Elo 초기값 사용']=='예'
+
+
+def test_fourteen_api_fixtures_share_one_information_cutoff() -> None:
+    now=datetime(2026,10,27,0,tzinfo=timezone.utc)
+    fixture=now+timedelta(hours=2)
+    matches=_history(fixture)+[_scheduled_match(500+i,fixture+timedelta(minutes=i)) for i in range(14)]
+    bundle=build_real_match_bundle({'matches':matches},target_date=date(2026,10,27),now=now)
+    assert len(bundle.input_frame)==14
+    assert bundle.evidence_frame['예측 기준시각(KST)'].nunique()==1
+    assert bundle.evidence_frame['API 조회시각(KST)'].nunique()==1
+
+
+def test_api_refuses_team_id_with_conflicting_name() -> None:
+    now=datetime(2026,10,27,0,tzinfo=timezone.utc)
+    fixture=now+timedelta(hours=2)
+    record=_finished_match(1,now-timedelta(days=1),1,'다른 홈 이름',2,'실제 원정',1,0)
+    bundle=build_real_match_bundle({'matches':[record,_scheduled_match(2,fixture)]},target_date=date(2026,10,27),now=now)
+    assert bundle.input_frame.empty

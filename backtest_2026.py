@@ -22,6 +22,7 @@ from football_data import HistoricalMatch, calculate_elo_ratings, calculate_team
 from models import OUTCOMES, ModelConfig, analyze_dataframe, calculate_top_combinations
 
 MODEL_VERSION = "elo-poisson-dixon-coles-v1"
+TEMPORAL_POLICY_VERSION = "finish-and-availability-v2"
 ROUND_COLUMNS = ["year", "round", "number", "competition", "kickoff", "deadline",
                  "home_team", "away_team", "home_id", "away_id", "result_status",
                  "home_score", "away_score", "outcome", "source_url", "verification"]
@@ -69,7 +70,7 @@ def load_history(frame: pd.DataFrame) -> dict[str, list[tuple[HistoricalMatch, p
         if any(pd.isna(row[col]) or not str(row[col]).strip() for col in HISTORY_COLUMNS):
             raise ValueError(f"이력 {index + 1}행 필수값 누락")
         kick, finish, acquired = _time(row["kickoff"]), _time(row["finished_at"]), _time(row["acquired_at"])
-        if finish < kick or acquired < finish:
+        if finish <= kick or acquired < finish:
             raise ValueError(f"이력 {index + 1}행 시간 순서 오류")
         a, b = _score(row)
         try:
@@ -85,7 +86,8 @@ def load_history(frame: pd.DataFrame) -> dict[str, list[tuple[HistoricalMatch, p
         seen.add(key)
         match = HistoricalMatch(str(index), kick.to_pydatetime(), hid, str(row["home_team"]).strip(),
                                 aid, str(row["away_team"]).strip(), a, b)
-        groups.setdefault(code, []).append((match, finish))
+        # 이력 결과가 확정되고 해당 자료가 확보된 이후에만 이용 가능하다.
+        groups.setdefault(code, []).append((match, max(finish, acquired)))
     return groups
 
 
@@ -189,6 +191,8 @@ def predict(prepared: Prepared, history: dict[str, list[tuple[HistoricalMatch, p
             "dixon_coles_rho": config.dixon_coles_rho, "home_advantage_elo": config.home_advantage_elo,
             "elo_goal_scale": config.elo_goal_scale}, "created_at": datetime.now(timezone.utc).isoformat(),
             "cutoff": prepared.cutoff.isoformat(), "cutoff_basis": prepared.basis,
+            "temporal_policy": TEMPORAL_POLICY_VERSION,
+            "availability_verification": "사용자 제공 종료·확보시각 기준; 출처의 실제 당시 공개 여부는 별도 검증 필요",
             "predictions": rows, "top20": [{"outcomes": list(labels), "probability": prob} for labels, prob in combos.combinations],
             "assumption": "Elo 초기값 1500; 리그 및 홈/원정 평균 수축; 현 모델 고정 설정"}
 
@@ -289,7 +293,7 @@ def run(rounds: pd.DataFrame | None, history_frame: pd.DataFrame | None, output:
             try:
                 prepared = prepare_round(rounds, n)
                 fixture_json = prepared.fixtures.to_json(orient="records", date_format="iso")
-                key = hashlib.sha256((fixture_json + prepared.cutoff.isoformat() + history_digest + MODEL_VERSION).encode()).hexdigest()
+                key = hashlib.sha256((fixture_json + prepared.cutoff.isoformat() + history_digest + MODEL_VERSION + TEMPORAL_POLICY_VERSION).encode()).hexdigest()
                 path = checkpoints / f"round_{n:02d}_{key}.json"
                 if path.exists():
                     snapshot = json.loads(path.read_text(encoding="utf-8"))

@@ -21,8 +21,8 @@ def example_data():
         else: hg,ag=2,1
         m=HistoricalMatch(str(i),kickoff,h,f'Team {h}',a,f'Team {a}',hg,ag)
         events.append((m,pd.Timestamp(kickoff+timedelta(hours=3))))
-    cutoff=pd.Timestamp('2025-12-25T00:00:00Z')
-    fixture={'number':1,'competition':'PL','kickoff':'2025-12-26T00:00:00Z','home_team':'Team 1','away_team':'Team 2','home_id':1,'away_id':2}
+    cutoff=pd.Timestamp('2026-01-09T00:00:00Z')
+    fixture={'number':1,'competition':'PL','kickoff':'2026-01-10T00:00:00Z','home_team':'Team 1','away_team':'Team 2','home_id':1,'away_id':2}
     return {'PL':events},fixture,cutoff
 
 
@@ -72,6 +72,13 @@ def test_changing_cutoff_limits_inputs_and_2026_training_is_rejected():
     assert earlier['history_count']<later['history_count']
     with pytest.raises(ValueError,match='1월 이전'):
         train(history,pd.Timestamp('2026-07-28T00:00:00Z'))
+
+
+def test_model_trained_after_target_cutoff_is_rejected():
+    history,fixture,_=example_data()
+    model=train(history,pd.Timestamp('2026-01-01T00:00:00+09:00'))
+    with pytest.raises(ValueError,match='학습 종료시각'):
+        diagnose(fixture,history,pd.Timestamp('2025-12-25T00:00:00Z'),model)
 
 
 def test_reveal_refuses_changed_saved_prediction():

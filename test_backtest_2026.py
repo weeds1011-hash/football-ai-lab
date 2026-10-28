@@ -24,7 +24,7 @@ def data() -> tuple[pd.DataFrame, pd.DataFrame]:
                         "source_url": "demo://fictional", "verification": "확인"})
         history.append({"competition": "TEST", "kickoff": "2025-12-28 20:00", "finished_at": "2025-12-28 22:00",
                         "home_team": home, "away_team": away, "home_id": n * 2, "away_id": n * 2 + 1,
-                        "home_score": 1, "away_score": 0, "source_url": "demo://fictional", "acquired_at": "2026-01-05 12:00"})
+                        "home_score": 1, "away_score": 0, "source_url": "demo://fictional", "acquired_at": "2025-12-29 12:00"})
     return pd.DataFrame(targets), pd.DataFrame(history)
 
 
@@ -47,11 +47,26 @@ def test_future_truth_cannot_change_prediction_and_late_results_excluded() -> No
     future = history.iloc[[0]].copy()
     future["kickoff"] = "2026-01-04 18:30"
     future["finished_at"] = "2026-01-04 20:30"
+    future["acquired_at"] = "2026-01-05 12:00"
     future["home_score"] = 10
     with_future = pd.concat([history, future], ignore_index=True)
     b = predict(prepare_round(rounds, 1), load_history(with_future))
     assert a["predictions"] == b["predictions"]
     assert a["top20"] == b["top20"]
+
+
+def test_acquisition_after_deadline_is_never_used_as_prior() -> None:
+    rounds, history = data()
+    history.loc[0, "acquired_at"] = "2026-01-05 12:00"
+    with pytest.raises(ValueError, match="전력 기록 부족"):
+        predict(prepare_round(rounds, 1), load_history(history))
+
+
+def test_missing_acquisition_is_not_strictly_verified() -> None:
+    _, history = data()
+    history.loc[0, "acquired_at"] = ""
+    with pytest.raises(ValueError, match="필수값 누락"):
+        load_history(history)
 
 
 def test_unknown_or_mismatched_team_and_special_round_excluded() -> None:
@@ -81,6 +96,7 @@ def test_cutoff_fallback_and_in_progress_history_exclusion() -> None:
     assert prepared.cutoff.strftime("%Y-%m-%d %H:%M") == "2026-01-04 19:59"
     history.loc[0, "kickoff"] = "2026-01-04 19:30"
     history.loc[0, "finished_at"] = "2026-01-04 21:30"
+    history.loc[0, "acquired_at"] = "2026-01-04 22:00"
     with pytest.raises(ValueError, match="전력 기록 부족"):
         predict(prepared, load_history(history))
 

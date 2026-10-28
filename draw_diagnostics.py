@@ -108,12 +108,13 @@ class RiskModel:
         return float(1/(1+np.exp(-np.clip(z@self.coefficients,-25,25))))
 
 
-def train(history: dict[str, list[tuple[HistoricalMatch, pd.Timestamp]]], training_end: object) -> RiskModel:
-    """학습 경기는 2025년 이전에 시작하고, 결과가 종료 전 확인된 경기만 사용한다."""
+def train(history: dict[str, list[tuple[HistoricalMatch, pd.Timestamp]]], training_end: object, *,
+          latest_training_end: object = '2026-01-01T00:00:00+09:00') -> RiskModel:
+    """각 학습 경기 전 정보로 특성을 만들고 학습 종료 전 확인된 결과만 사용한다."""
     check_history(history)
     end=_stamp(training_end)
-    if end > pd.Timestamp('2026-01-01T00:00:00+09:00'):
-        raise ValueError('이 실험의 학습 종료는 2026년 1월 이전이어야 합니다.')
+    if end > _stamp(latest_training_end):
+        raise ValueError('이 실험의 학습 종료는 허용된 시점 이전이어야 합니다. 1·2회차는 2026년 1월 이전만 허용합니다.')
     items=[]
     for code, records in history.items():
         for match, known in records:
@@ -126,7 +127,7 @@ def train(history: dict[str, list[tuple[HistoricalMatch, pd.Timestamp]]], traini
                 items.append((match.kickoff,f['vector'],int(match.home_goals==match.away_goals)))
     items.sort(key=lambda item:item[0])
     if len(items)<15 or sum(item[2] for item in items)<3 or len(items)-sum(item[2] for item in items)<3:
-        raise ValueError('2025년까지 시점 검증된 학습 경기가 부족하여 확률 보정을 실행할 수 없습니다.')
+        raise ValueError('학습 종료 이전 시점이 확인된 경기가 부족하여 확률 보정을 실행할 수 없습니다.')
     x=np.asarray([i[1] for i in items],dtype=float); y=np.asarray([i[2] for i in items],dtype=float)
     mean=x.mean(axis=0); scale=x.std(axis=0); scale[scale<1e-8]=1
     design=np.column_stack([np.ones(len(x)),(x-mean)/scale])
@@ -144,6 +145,8 @@ def train(history: dict[str, list[tuple[HistoricalMatch, pd.Timestamp]]], traini
 
 
 def diagnose(fixture: Mapping[str, object], history: dict[str, list[tuple[HistoricalMatch, pd.Timestamp]]], cutoff: object, model: RiskModel) -> dict:
+    if _stamp(model.training_end) >= _stamp(cutoff):
+        raise ValueError('무승부 모델의 학습 종료시각이 경기 예측 기준시각보다 빠르지 않습니다.')
     f=features(fixture,history,cutoff)
     risk=model.probability(f['vector'])
     base=f['base_probs']; remaining=base[0]+base[2]
