@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
+import streamlit as st
 from streamlit.testing.v1 import AppTest
 
 from models import (
@@ -195,7 +196,9 @@ def test_streamlit_demo_buttons_complete_without_exception() -> None:
     assert combination_search.max_frontier_size == 20
 
 
-def test_streamlit_real_api_mode_without_key_keeps_csv_fallback() -> None:
+def test_streamlit_real_api_mode_without_key_keeps_csv_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("FOOTBALL_DATA_API_KEY", raising=False)
+    monkeypatch.setattr(st, "secrets", {})
     app = AppTest.from_file(str(ROOT / "app.py")).run(timeout=30)
     app.radio(key="proto_source").set_value("실제 데이터 API").run(timeout=30)
     assert not list(app.exception)
