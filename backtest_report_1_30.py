@@ -13,6 +13,7 @@ ROUND_COLUMNS = ['회차', '확보 경기', 'AI 단식 적중', '홈승 기준�
 SOURCES = [
     ('베트맨 공식 1회차', 'https://www.betman.co.kr/main/mainPage/gamebuy/winrstDetl.do?gmId=G011&gmTs=260001', '직접 화면 확인, 자동 수집 아님'),
     ('베트맨 공식 2회차', 'https://www.betman.co.kr/main/mainPage/gamebuy/winrstDetl.do?gmId=G011&gmTs=260002', '직접 화면 확인, 자동 수집 아님'),
+    ('베트맨 공식 3회차', 'https://www.betman.co.kr/main/mainPage/gamebuy/winrstDetl.do?gmId=G011&gmTs=260003', '직접 화면 확인; 4·6번 적중특례'),
     ('football-data.org API', 'https://www.football-data.org/coverage', '경기 ID, 이력 및 결과'),
     ('리그 공식 결과, 피사', 'https://images.legaseriea.it/image/private/fl_attachment/prd/bk75vvzmfnhxockat7v1.pdf', '2025-12-27 결과 확인'),
     ('리그 공식 결과, 크레모네세', 'https://images.legaseriea.it/image/private/fl_attachment/prd/hojzkjmj1pghsvatefgu.pdf', '2025-12-28 결과 확인'),
@@ -85,7 +86,17 @@ def generate(input_dir: Path, output_dir: Path) -> dict[str, pd.DataFrame]:
             all_tops.append(tops)
         except (ValueError, KeyError, OSError, json.JSONDecodeError) as exc:
             reason = str(exc)
-            rounds.append([number, '미검증', '', '', '', '', '미완료', reason])
+            observed = input_dir / f'round{number:02d}_observation.json'
+            secured = '미검증'
+            if observed.is_file():
+                try:
+                    observation = json.loads(observed.read_text(encoding='utf-8'))
+                    if observation.get('round') == number and observation.get('official_fixture_count') == 14:
+                        secured = '14/14 · 공식 화면 확인'
+                        reason = str(observation.get('reason') or reason)
+                except (ValueError, OSError, json.JSONDecodeError):
+                    pass
+            rounds.append([number, secured, '', '', '', '', '미완료', reason])
             errors.append({'회차':number, '사유':reason})
     rd = pd.DataFrame(rounds, columns=ROUND_COLUMNS)
     mt = pd.concat(all_matches, ignore_index=True) if all_matches else pd.DataFrame(columns=['회차','번호','홈팀','원정팀','홈승%','무%','원정승%','AI 선택','실제 결과','적중'])
@@ -96,12 +107,12 @@ def generate(input_dir: Path, output_dir: Path) -> dict[str, pd.DataFrame]:
     for name, frame in results.items():
         frame.to_csv(output_dir / f'backtest_2026_1_30_{name}.csv', index=False, encoding='utf-8-sig')
     lines = ['# 2026 승무패 1~30회차 과거 시점 재현', '',
-             '실제 당시 저장된 예측이 아닌 사후 재구성이다. 1~2회차만 공식 화면을 수동 대조했다.',
-             '2024/25 과거 이력과 공식 검증한 소수 경기만 사용했다. 같은 시즌의 다수 경기와 당시 자료 가용성은 검증되지 않아 제외했다.',
-             '승격팀에는 1~2경기만 있는 등 모든 경기의 전력 추정에 높은 불확실성이 있다.',
-             '1회차 9번: 베트맨 예정시각 00:00, API 00:15. 당시 기사에서 15분 지연을 확인했다. 두 시각 모두 회차 마감 이후다.',
+             '실제 당시 저장된 예측이 아닌 사후 재구성이다.',
              f'완료: {len(all_matches)}/30회차, {len(mt)}경기. 미완료 회차는 성능 통계에서 제외.', '']
     if not mt.empty:
+        lines += ['2024/25 과거 이력과 공식 검증한 소수 경기만 사용했다. 같은 시즌의 다수 경기와 당시 자료 가용성은 검증되지 않아 제외했다.',
+                  '승격팀에는 1~2경기만 있는 등 모든 경기의 전력 추정에 높은 불확실성이 있다.',
+                  '1회차 9번: 베트맨 예정시각 00:00, API 00:15. 당시 기사에서 15분 지연을 확인했다. 두 시각 모두 회차 마감 이후다.', '']
         counts = mt.groupby('회차')['적중'].sum()
         home = mt['홈승 기준선 적중'].astype(bool)
         y = mt['실제 결과']
