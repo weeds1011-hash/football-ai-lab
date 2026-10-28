@@ -505,6 +505,65 @@ with review_tab:
     else:
         st.info("이 환경에 검증된 1~30회차 보고서가 없습니다. 로컬 보고서를 생성하면 이 화면에 표시됩니다.")
 
+    from draw_diagnostics import RESEARCH_NOTICE
+    from draw_research_workflow import create_predictions, reveal_results
+
+    st.markdown("### 실험: 무승부 진단 비교")
+    st.caption(RESEARCH_NOTICE)
+    st.info("이 분석은 베트맨 사전 투표율, 베팅 비율 또는 배당률을 참고하지 않습니다. Football AI Lab의 자체 축구 통계 모델만 사용합니다.")
+    st.warning("2026년 1·2회차 재분석은 이미 결과를 확인한 데이터를 대상으로 한 사후 연구 실험입니다. 독립 검증 결과나 실제 당시 예측 성적이 아닙니다.")
+    st.caption("신규 진단은 소표본 실험입니다. 학습 기준시각 이전에 실제로 확인 가능한 경기 이력만 사용해야 합니다.")
+    local_research = APP_DIR / 'reports' / 'local_backtest_2026' / '무승부_진단_연구' / '1_2회차_경기별_모델비교.csv'
+    local_metrics = local_research.parent / '1_2회차_모델별_성능.csv'
+    if local_research.is_file() and local_metrics.is_file():
+        local_results = pd.read_csv(local_research, encoding='utf-8-sig')
+        local_summary = pd.read_csv(local_metrics, encoding='utf-8-sig')
+        local_show = st.toggle('1·2회차 실제 결과와 실험 성적 공개', key='draw_local_reveal')
+        visible = ['회차','경기번호','홈팀','원정팀','기존 무%','보강 무%','개선 무%',
+                   '기존 선택','보강 선택','개선 선택','위험 점수','후보','후보 근거','홈 이력수','원정 이력수']
+        if local_show: visible += ['실제','실제 스코어','개선 효과']
+        st.dataframe(local_results[visible],hide_index=True,width='stretch')
+        if local_show:
+            st.caption('A 기존 / B 이력 보강 / C 진단 확률 / D 보강 확률 유지와 후보 표시')
+            st.dataframe(local_summary,hide_index=True,width='stretch')
+            st.download_button('1·2회차 비교 CSV 다운로드',result_csv_bytes(local_results),
+                               file_name='draw_research_1_2.csv',mime='text/csv',key='draw_local_download')
+    else:
+        st.caption('현재 환경에는 로컬 1·2회차 실험 결과가 없습니다. 아래의 검증된 사용자 자료로 분석할 수 있습니다.')
+    with st.expander('검증된 CSV로 실험 실행'):
+        st.caption('회차 CSV와 기존·보강 이력 CSV를 각각 올리세요. 지정 양식 외 열은 거부하며, 이력의 확보시각은 당시 확인 근거가 있어야 합니다.')
+        draw_rounds=st.file_uploader('공식 검증된 회차 CSV',type='csv',key='draw_rounds')
+        draw_old=st.file_uploader('기존 경기 이력 CSV',type='csv',key='draw_old')
+        draw_extra=st.file_uploader('보강 경기 이력 CSV',type='csv',key='draw_extra')
+        draw_round=st.selectbox('실험 회차', [1,2],key='draw_round')
+        if draw_rounds and draw_old and draw_extra:
+            draw_signature=hashlib.sha256(draw_rounds.getvalue()+draw_old.getvalue()+draw_extra.getvalue()+str(draw_round).encode()).hexdigest()
+            if st.button('경기 전 예측 고정',key='draw_predict'):
+                try:
+                    rr=pd.read_csv(draw_rounds,encoding='utf-8-sig')
+                    old=pd.read_csv(draw_old,encoding='utf-8-sig')
+                    extra=pd.read_csv(draw_extra,encoding='utf-8-sig')
+                    with st.spinner('경기 전 이력으로 무승부 신호를 계산하고 있습니다...'):
+                        payload,answers=create_predictions(rr,old,extra,draw_round)
+                    st.session_state['draw_experiment']={'signature':draw_signature,'prediction':payload,'answers':answers}
+                except (ValueError, OSError, pd.errors.ParserError) as exc:
+                    st.error(f'무승부 진단 자료 오류: {exc}')
+            saved=st.session_state.get('draw_experiment')
+            if saved and saved['signature']==draw_signature:
+                p=saved['prediction']
+                st.caption(f"학습 {p['training_count']}경기 · 무승부 {p['training_draws']}경기 · 종료 {p['training_end']} · 후보 기준은 학습 점수 상위 25%")
+                st.dataframe(pd.DataFrame([{k:v for k,v in row.items() if k not in ('홈 최근5','원정 최근5','홈 최근10','원정 최근10')}
+                                           for row in p['predictions']]),hide_index=True,width='stretch')
+                if st.toggle('고정된 예측의 실제 결과 공개',key='draw_reveal'):
+                    try:
+                        detail,summary=reveal_results(p,saved['answers'])
+                        st.dataframe(summary,hide_index=True,width='stretch')
+                        st.dataframe(detail,hide_index=True,width='stretch')
+                        st.download_button('무승부 진단 결과 CSV 다운로드',result_csv_bytes(detail),
+                                           file_name='draw_diagnostics.csv',mime='text/csv',key='draw_download')
+                    except ValueError as exc:
+                        st.error(f'예측 검증 오류: {exc}')
+
 with st.expander("CSV 형식 안내"):
     st.markdown(
         """
